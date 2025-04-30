@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -184,15 +185,8 @@ func (app *App) login() (*Session, error) {
 }
 
 // getFollowerCount retrieves the follower count for a user
-func (app *App) getFollowerCount(actor string) (int, error) {
+func (app *App) getFollowerCount(session *Session, actor string) (int, error) {
 	app.logger.Debug("Getting follower count for actor: %s", actor)
-	
-	// Get a session to authenticate
-	session, err := app.login()
-	if err != nil {
-		app.logger.Error("Failed to login: %v", err)
-		return 0, fmt.Errorf("failed to login: %w", err)
-	}
 	
 	url := apiBase + "/app.bsky.actor.getProfile?actor=" + actor
 	req, err := http.NewRequest("GET", url, nil)
@@ -268,6 +262,24 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 	if resp.StatusCode == http.StatusOK {
 		app.logger.Info("Successfully followed: %s", handleOrDid)
 		app.followed[handleOrDid] = true
+		
+		// Update the user's followed status in the JSON file
+		users, err := app.loadUsersFromJSON("users.json")
+		if err != nil {
+			app.logger.Error("Failed to load users for status update: %v", err)
+			return fmt.Errorf("failed to load users for status update: %w", err)
+		}
+		
+		for i, user := range users {
+			if user.Handle == handleOrDid || user.DID == handleOrDid {
+				users[i].Followed = true
+				if err := app.saveUserToJSON(users[i], "users.json"); err != nil {
+					app.logger.Error("Failed to update user's followed status: %v", err)
+					return fmt.Errorf("failed to update user's followed status: %w", err)
+				}
+				break
+			}
+		}
 	} else if resp.StatusCode == http.StatusBadRequest {
 		app.logger.Info("Already following: %s", handleOrDid)
 		app.followed[handleOrDid] = true
@@ -315,6 +327,10 @@ func (app *App) saveUserToJSON(newUser TargetUser, filePath string) error {
 	found := false
 	for i, u := range users {
 		if u.Handle == newUser.Handle || u.DID == newUser.DID {
+			// Preserve the followed status if it's already set
+			if u.Followed {
+				newUser.Followed = true
+			}
 			users[i] = newUser
 			found = true
 			app.logger.Debug("Updated existing user: %s", newUser.Handle)
@@ -326,6 +342,10 @@ func (app *App) saveUserToJSON(newUser TargetUser, filePath string) error {
 		users = append(users, newUser)
 		app.logger.Debug("Added new user: %s", newUser.Handle)
 	}
+	
+	sort.Slice(users, func(i, j int) bool {
+		return users[i].Followers > users[j].Followers
+	})
 	
 	data, err := json.MarshalIndent(users, "", "  ")
 	if err != nil {
@@ -419,6 +439,13 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 	}
 	app.logger.Info("Loaded %d existing users from file", len(existingUsers))
 
+	// Get a session to authenticate all requests
+	session, err := app.login()
+	if err != nil {
+		app.logger.Error("Failed to login: %v", err)
+		return fmt.Errorf("failed to login: %w", err)
+	}
+
 	// Fetch top handles from bsky.directory
 	app.logger.Info("Fetching top handles from bsky.directory")
 	handles, err := app.fetchTopHandlesFromBskyDirectory()
@@ -442,7 +469,7 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 		}
 
 		app.logger.Info("Processing new user: %s", handle)
-		followers, err := app.getFollowerCount(handle)
+		followers, err := app.getFollowerCount(session, handle)
 		if err != nil {
 			app.logger.Warn("Failed to get follower count for %s: %v", handle, err)
 			continue
@@ -452,7 +479,6 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 			Handle:    handle,
 			Followers: followers,
 			SavedOn:   time.Now().Format(time.RFC3339),
-			Followed:  false,
 		}
 
 		if err := app.saveUserToJSON(newUser, filePath); err != nil {
@@ -535,7 +561,7 @@ func main() {
 		// Update follower count if needed
 		count := user.Followers
 		if count == 0 {
-			count, err = app.getFollowerCount(actor)
+			count, err = app.getFollowerCount(session, actor)
 			if err != nil {
 				app.logger.Warn("Skipping %s (error getting follower count: %v)", actor, err)
 				continue
