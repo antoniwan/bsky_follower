@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +84,7 @@ type TargetUser struct {
 	DID       string `json:"did"`
 	Followers int    `json:"followers"`
 	SavedOn   string `json:"savedOn"`
+	Followed  bool   `json:"followed"`
 }
 
 // App represents the main application
@@ -327,10 +327,6 @@ func (app *App) saveUserToJSON(newUser TargetUser, filePath string) error {
 		app.logger.Debug("Added new user: %s", newUser.Handle)
 	}
 	
-	sort.Slice(users, func(i, j int) bool {
-		return users[i].Followers > users[j].Followers
-	})
-	
 	data, err := json.MarshalIndent(users, "", "  ")
 	if err != nil {
 		app.logger.Error("Failed to marshal users: %v", err)
@@ -456,6 +452,7 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 			Handle:    handle,
 			Followers: followers,
 			SavedOn:   time.Now().Format(time.RFC3339),
+			Followed:  false,
 		}
 
 		if err := app.saveUserToJSON(newUser, filePath); err != nil {
