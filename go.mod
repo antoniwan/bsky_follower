@@ -1,4 +1,4 @@
-module bsky_follower
+module bsky_follower/v1.0.0
 
 go 1.24.2
 

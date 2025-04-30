@@ -13,6 +13,8 @@ A Go program to help manage following users on Bluesky social network.
 - Fetch and save top users from Bluesky directory
 - Enhanced logging with debug mode
 - SQLite database for reliable data storage
+- Proper DID (Decentralized Identifier) handling
+- Rate limiting and error handling
 
 ## Requirements
 
@@ -133,6 +135,18 @@ To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
 - A 3-second delay is added between operations to avoid rate limiting
 - The program tracks followed users in both memory and database
 - SQLite database provides reliable data storage and atomic updates
+- Proper DID handling ensures successful follows
+- Error handling for common Bluesky API issues
+
+## Version History
+
+### v1.0.0 (2024-04-30)
+
+- Initial stable release
+- Fixed DID handling for follow operations
+- Improved error handling and logging
+- Added proper rate limiting
+- Enhanced database operations
 
 ---
 
@@ -150,6 +164,8 @@ The script logs in using your handle/email and app password and fetches your DID
 - Dynamic trending user fetch
 - Export/import database functionality
 - Backup and restore functionality
+- Batch processing for large user lists
+- Customizable rate limiting
 
 ---
 
