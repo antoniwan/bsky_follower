@@ -24,19 +24,22 @@ A Go program to help manage following users on Bluesky social network.
 1. Create a `.env` file in the project root with the following variables:
 
 ```bash
-# Required: Bluesky API credentials
-BSKY_IDENTIFIER=your.handle.bsky.social
-BSKY_PASSWORD=your-app-password
+# BlueSky API Configuration
+BSKY_IDENTIFIER=your.bsky.social
+BSKY_PASSWORD=your_app_password
 
-# Optional: Fallback handles to use if API returns no suggestions
-# Comma-separated list of handles
-BSKY_FALLBACK_HANDLES=user1.bsky.social,user2.bsky.social,user3.bsky.social
+# Application Settings
+DEBUG_MODE=false
+REQUEST_TIMEOUT=30s
 
-# Optional: Request timeout in seconds (default: 10)
-BSKY_TIMEOUT=10
+# Database Configuration
+DB_PATH=users.db
 
-# Optional: Enable debug mode for detailed logging
-DEBUG_MODE=true
+# Fallback Handles (comma-separated list of handles to use if directory fetch fails)
+FALLBACK_HANDLES=handle1.bsky.social,handle2.bsky.social
+
+# Rate Limiting
+RATE_LIMIT_DELAY=1s
 ```
 
 2. Install dependencies:
