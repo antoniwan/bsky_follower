@@ -327,9 +327,9 @@ func (app *App) saveUserToDB(user TargetUser) error {
 	return nil
 }
 
-// fetchTopHandlesFromBskyDirectory fetches top handles from Bluesky directory
+// fetchTopHandlesFromBskyDirectory fetches top handles from multiple Bluesky sources
 func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
-	app.logger.Info("Fetching top handles from Bluesky directory")
+	app.logger.Info("Fetching top handles from multiple Bluesky sources")
 	
 	// First get a session to authenticate
 	session, err := app.login()
@@ -338,48 +338,108 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 		return nil, fmt.Errorf("failed to login: %w", err)
 	}
 
-	url := apiBase + "/app.bsky.actor.getSuggestions?limit=50"
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		app.logger.Error("Failed to create suggestions request: %v", err)
-		return nil, fmt.Errorf("failed to create suggestions request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+	// Use a map to deduplicate handles
+	uniqueHandles := make(map[string]bool)
+	var allHandles []string
 
-	resp, err := app.client.Do(req)
-	if err != nil {
-		app.logger.Error("Failed to fetch from Bluesky API: %v", err)
-		return nil, fmt.Errorf("failed to fetch from Bluesky API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		app.logger.Error("Suggestions fetch failed with status: %d", resp.StatusCode)
-		return nil, fmt.Errorf("suggestions fetch failed with status: %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Actors []struct {
-			Handle string `json:"handle"`
-		} `json:"actors"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		app.logger.Error("Failed to decode response: %v", err)
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	var handles []string
-	seen := make(map[string]bool)
-	for _, actor := range result.Actors {
-		handle := actor.Handle
-		if !seen[handle] {
-			handles = append(handles, handle)
-			seen[handle] = true
+	// Function to add handles to our collection
+	addHandles := func(handles []string) {
+		for _, handle := range handles {
+			if !uniqueHandles[handle] {
+				uniqueHandles[handle] = true
+				allHandles = append(allHandles, handle)
+			}
 		}
 	}
 
-	if len(handles) == 0 {
+	// 1. Get trending users
+	app.logger.Info("Fetching trending users")
+	trendingURL := apiBase + "/app.bsky.unspecced.getPopular?limit=100"
+	req, err := http.NewRequest("GET", trendingURL, nil)
+	if err != nil {
+		app.logger.Error("Failed to create trending request: %v", err)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+		resp, err := app.client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var result struct {
+					Actors []struct {
+						Handle string `json:"handle"`
+					} `json:"actors"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+					var handles []string
+					for _, actor := range result.Actors {
+						handles = append(handles, actor.Handle)
+					}
+					addHandles(handles)
+					app.logger.Info("Added %d trending users", len(handles))
+				}
+			}
+		}
+	}
+
+	// 2. Get directory suggestions
+	app.logger.Info("Fetching directory suggestions")
+	dirURL := apiBase + "/app.bsky.actor.getSuggestions?limit=100"
+	req, err = http.NewRequest("GET", dirURL, nil)
+	if err != nil {
+		app.logger.Error("Failed to create suggestions request: %v", err)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+		resp, err := app.client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var result struct {
+					Actors []struct {
+						Handle string `json:"handle"`
+					} `json:"actors"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+					var handles []string
+					for _, actor := range result.Actors {
+						handles = append(handles, actor.Handle)
+					}
+					addHandles(handles)
+					app.logger.Info("Added %d directory suggestions", len(handles))
+				}
+			}
+		}
+	}
+
+	// 3. Get popular users by follower count
+	app.logger.Info("Fetching popular users")
+	popularURL := apiBase + "/app.bsky.actor.searchActors?limit=100&sort=followerCount"
+	req, err = http.NewRequest("GET", popularURL, nil)
+	if err != nil {
+		app.logger.Error("Failed to create popular request: %v", err)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+		resp, err := app.client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var result struct {
+					Actors []struct {
+						Handle string `json:"handle"`
+					} `json:"actors"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+					var handles []string
+					for _, actor := range result.Actors {
+						handles = append(handles, actor.Handle)
+					}
+					addHandles(handles)
+					app.logger.Info("Added %d popular users", len(handles))
+				}
+			}
+		}
+	}
+
+	if len(allHandles) == 0 {
 		if len(app.config.FallbackHandles) == 0 {
 			app.logger.Error("No handles found and no fallback handles configured")
 			return nil, fmt.Errorf("no handles found and no fallback handles configured")
@@ -388,8 +448,8 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 		return app.config.FallbackHandles, nil
 	}
 
-	app.logger.Info("Successfully fetched %d unique handles", len(handles))
-	return handles, nil
+	app.logger.Info("Successfully fetched %d unique handles from multiple sources", len(allHandles))
+	return allHandles, nil
 }
 
 // fetchAndSaveTopUsers fetches and saves top users
@@ -411,14 +471,28 @@ func (app *App) fetchAndSaveTopUsers(simulate bool) error {
 		return fmt.Errorf("failed to login: %w", err)
 	}
 
-	// Fetch top handles from bsky.directory
-	app.logger.Info("Fetching top handles from bsky.directory")
+	// Check when we last updated users
+	var lastUpdate time.Time
+	err = app.db.QueryRow("SELECT MAX(saved_on) FROM users").Scan(&lastUpdate)
+	if err != nil {
+		app.logger.Warn("Could not determine last update time: %v", err)
+		lastUpdate = time.Now().Add(-24 * time.Hour) // Default to 24 hours ago
+	}
+
+	// Only fetch new users if it's been more than 6 hours since last update
+	if time.Since(lastUpdate) < 6*time.Hour {
+		app.logger.Info("Skipping fetch - last update was %v ago", time.Since(lastUpdate))
+		return nil
+	}
+
+	// Fetch top handles from multiple sources
+	app.logger.Info("Fetching top handles from multiple sources")
 	handles, err := app.fetchTopHandlesFromBskyDirectory()
 	if err != nil {
 		app.logger.Error("Failed to fetch top handles: %v", err)
 		return fmt.Errorf("failed to fetch top handles: %w", err)
 	}
-	app.logger.Info("Successfully fetched %d handles from bsky.directory", len(handles))
+	app.logger.Info("Successfully fetched %d handles from multiple sources", len(handles))
 
 	// Create a map of existing users for quick lookup
 	existingMap := make(map[string]bool)
@@ -437,6 +511,12 @@ func (app *App) fetchAndSaveTopUsers(simulate bool) error {
 		followers, err := app.getFollowerCount(session, handle)
 		if err != nil {
 			app.logger.Warn("Failed to get follower count for %s: %v", handle, err)
+			continue
+		}
+
+		// Skip users with very low follower counts
+		if followers < 100 {
+			app.logger.Debug("Skipping user with low follower count: %s (%d followers)", handle, followers)
 			continue
 		}
 
