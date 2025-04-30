@@ -5,18 +5,19 @@ A Go program to help manage following users on Bluesky social network.
 ## Features
 
 - Login to Bluesky using your credentials
-- Follow users from a predefined list
+- Follow users from a database
 - Filter users by minimum follower count
 - Simulation mode to preview actions
 - Track already followed users
 - Update follower counts automatically
 - Fetch and save top users from Bluesky directory
+- Enhanced logging with debug mode
+- SQLite database for reliable data storage
 
 ## Requirements
 
 - Go 1.16 or later
 - Bluesky account credentials
-- `users.json` file with target users (optional)
 
 ## Setup
 
@@ -33,6 +34,9 @@ BSKY_FALLBACK_HANDLES=user1.bsky.social,user2.bsky.social,user3.bsky.social
 
 # Optional: Request timeout in seconds (default: 10)
 BSKY_TIMEOUT=10
+
+# Optional: Enable debug mode for detailed logging
+DEBUG_MODE=true
 ```
 
 2. Install dependencies:
@@ -52,8 +56,7 @@ go run main.go
 The application supports the following command-line flags:
 
 - `-simulate`: Run in simulation mode (no actual follows)
-- `-file`: Path to the users JSON file (default: "users.json")
-- `-update-top`: Fetch top users from bsky.directory and save to JSON
+- `-update-top`: Fetch top users from bsky.directory and save to database
 - `-min-followers`: Minimum followers required to follow (default: 0)
 - `-real`: Actually follow users (default is simulation only)
 
@@ -65,39 +68,52 @@ The application supports the following command-line flags:
 go run main.go --update-top
 ```
 
-2. Follow users from a JSON file with minimum followers:
+2. Follow users with minimum followers:
 
 ```bash
-go run main.go --file users.json --min-followers 1000 --real
+go run main.go --min-followers 1000 --real
 ```
 
 3. Simulate following users:
 
 ```bash
-go run main.go --simulate --file users.json
+go run main.go --simulate
 ```
 
-## Configuration
+## Data Storage
 
-Create a `users.json` file in the same directory as the program with the following structure:
+The application uses SQLite for data storage. All user data is stored in `users.db` with the following schema:
 
-```json
-[
-  {
-    "handle": "username.bsky.social",
-    "did": "did:plc:...",
-    "followers": 123,
-    "savedOn": "2024-03-14T12:00:00Z"
-  }
-]
+```sql
+CREATE TABLE users (
+    handle TEXT PRIMARY KEY,
+    did TEXT,
+    followers INTEGER,
+    saved_on TEXT,
+    followed BOOLEAN
+)
 ```
 
 Fields:
 
 - `handle`: The user's Bluesky handle (e.g., "username.bsky.social")
 - `did`: The user's Decentralized Identifier (DID)
-- `followers`: Number of followers (optional, will be fetched if 0)
-- `savedOn`: Timestamp when the user was added (optional)
+- `followers`: Number of followers
+- `saved_on`: Timestamp when the user was added
+- `followed`: Whether the user has been followed
+
+## Logging
+
+The application provides detailed logging with multiple levels:
+
+- `TRACE`: Most detailed logging (only in debug mode)
+- `DEBUG`: Detailed logging (only in debug mode)
+- `INFO`: General information
+- `WARN`: Warning messages
+- `ERROR`: Error messages
+- `AUDIT`: Important state changes
+
+To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
 
 ## Environment Variables
 
@@ -105,13 +121,15 @@ Fields:
 - `BSKY_PASSWORD`: Your Bluesky app password
 - `BSKY_FALLBACK_HANDLES`: Comma-separated list of fallback handles (optional)
 - `BSKY_TIMEOUT`: Request timeout in seconds (optional, default: 10)
+- `DEBUG_MODE`: Enable detailed logging (optional, default: false)
 
 ## Notes
 
 - The program will skip users you're already following
 - Follower counts are automatically updated if not provided
 - A 3-second delay is added between operations to avoid rate limiting
-- The program tracks followed users in memory to avoid duplicate follows
+- The program tracks followed users in both memory and database
+- SQLite database provides reliable data storage and atomic updates
 
 ---
 
@@ -125,9 +143,10 @@ The script logs in using your handle/email and app password and fetches your DID
 
 ## 📈 Planned Features
 
-- SQLite + JSON cache for followed users
-- Dynamic trending user fetch
 - Better error handling + logging
+- Dynamic trending user fetch
+- Export/import database functionality
+- Backup and restore functionality
 
 ---
 
@@ -137,4 +156,5 @@ Built by [@antoniwan](https://github.com/antoniwan) 🛠️
 
 - Never commit your `.env` file to version control
 - Keep your app password secure
-- The application stores user data in a JSON file - ensure proper file permissions
+- The application uses SQLite for data storage - ensure proper file permissions
+- Debug mode should be disabled in production

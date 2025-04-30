@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,23 +10,25 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
+	_ "modernc.org/sqlite"
 )
 
 // Logger provides structured logging capabilities
 type Logger struct {
 	*log.Logger
+	debugMode bool
 }
 
 // NewLogger creates a new logger instance
 func NewLogger(w io.Writer) *Logger {
 	return &Logger{
-		Logger: log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+		Logger:    log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds),
+		debugMode: os.Getenv("DEBUG_MODE") == "true",
 	}
 }
 
@@ -41,12 +44,26 @@ func (l *Logger) Error(format string, v ...interface{}) {
 
 // Debug logs a debug message
 func (l *Logger) Debug(format string, v ...interface{}) {
-	l.Printf("[DEBUG] "+format, v...)
+	if l.debugMode {
+		l.Printf("[DEBUG] "+format, v...)
+	}
 }
 
 // Warn logs a warning message
 func (l *Logger) Warn(format string, v ...interface{}) {
 	l.Printf("[WARN] "+format, v...)
+}
+
+// Audit logs an audit message
+func (l *Logger) Audit(format string, v ...interface{}) {
+	l.Printf("[AUDIT] "+format, v...)
+}
+
+// Trace logs a trace message
+func (l *Logger) Trace(format string, v ...interface{}) {
+	if l.debugMode {
+		l.Printf("[TRACE] "+format, v...)
+	}
 }
 
 const (
@@ -94,16 +111,45 @@ type App struct {
 	client   *http.Client
 	followed map[string]bool
 	logger   *Logger
+	db       *sql.DB
 }
 
 // NewApp creates a new application instance
-func NewApp(config *Config) *App {
-	return &App{
+func NewApp(config *Config) (*App, error) {
+	// Initialize SQLite database
+	app := &App{
 		config:   config,
 		client:   &http.Client{Timeout: config.Timeout},
 		followed: make(map[string]bool),
 		logger:   NewLogger(os.Stdout),
 	}
+
+	// Initialize database
+	db, err := sql.Open("sqlite", "users.db")
+	if err != nil {
+		app.logger.Error("Failed to open database: %v", err)
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	app.db = db
+
+	// Create users table if it doesn't exist
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			handle TEXT PRIMARY KEY,
+			did TEXT,
+			followers INTEGER,
+			saved_on TEXT,
+			followed BOOLEAN
+		)
+	`)
+	if err != nil {
+		app.logger.Error("Failed to create table: %v", err)
+		return nil, fmt.Errorf("failed to create table: %w", err)
+	}
+
+	app.logger.Info("Application initialized with debug mode: %v", app.logger.debugMode)
+	app.logger.Debug("Database connection established")
+	return app, nil
 }
 
 // loadConfig loads configuration from environment variables
@@ -218,147 +264,66 @@ func (app *App) getFollowerCount(session *Session, actor string) (int, error) {
 	return profile.FollowersCount, nil
 }
 
-// followUser follows a user on Bluesky
-func (app *App) followUser(session *Session, handleOrDid string, simulate bool) error {
-	app.logger.Info("Attempting to follow user: %s (simulate=%v)", handleOrDid, simulate)
+// loadUsersFromDB loads users from the SQLite database
+func (app *App) loadUsersFromDB() ([]TargetUser, error) {
+	app.logger.Debug("Loading users from database")
+	startTime := time.Now()
 	
-	if app.followed[handleOrDid] {
-		app.logger.Info("Already followed %s (skipped)", handleOrDid)
-		return nil
-	}
-
-	if simulate {
-		app.logger.Info("Simulation mode: would follow: %s", handleOrDid)
-		return nil
-	}
-
-	payload := map[string]interface{}{
-		"collection": "app.bsky.graph.follow",
-		"repo":       session.Did,
-		"record":     FollowRecord{Subject: handleOrDid},
-	}
-
-	jsonBody, err := json.Marshal(payload)
+	rows, err := app.db.Query("SELECT handle, did, followers, saved_on, followed FROM users")
 	if err != nil {
-		app.logger.Error("Failed to marshal follow request: %v", err)
-		return fmt.Errorf("failed to marshal follow request: %w", err)
+		app.logger.Error("Failed to query users: %v", err)
+		return nil, fmt.Errorf("failed to query users: %w", err)
 	}
+	defer rows.Close()
 
-	req, err := http.NewRequest("POST", apiBase+"/com.atproto.repo.createRecord", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		app.logger.Error("Failed to create follow request: %v", err)
-		return fmt.Errorf("failed to create follow request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := app.client.Do(req)
-	if err != nil {
-		app.logger.Error("Failed to execute follow request: %v", err)
-		return fmt.Errorf("failed to execute follow request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		app.logger.Info("Successfully followed: %s", handleOrDid)
-		app.followed[handleOrDid] = true
-		
-		// Update the user's followed status in the JSON file
-		users, err := app.loadUsersFromJSON("users.json")
-		if err != nil {
-			app.logger.Error("Failed to load users for status update: %v", err)
-			return fmt.Errorf("failed to load users for status update: %w", err)
-		}
-		
-		for i, user := range users {
-			if user.Handle == handleOrDid || user.DID == handleOrDid {
-				users[i].Followed = true
-				if err := app.saveUserToJSON(users[i], "users.json"); err != nil {
-					app.logger.Error("Failed to update user's followed status: %v", err)
-					return fmt.Errorf("failed to update user's followed status: %w", err)
-				}
-				break
-			}
-		}
-	} else if resp.StatusCode == http.StatusBadRequest {
-		app.logger.Info("Already following: %s", handleOrDid)
-		app.followed[handleOrDid] = true
-		return nil
-	} else {
-		app.logger.Error("Failed to follow %s. Status: %d", handleOrDid, resp.StatusCode)
-		return fmt.Errorf("failed to follow %s. Status: %d", handleOrDid, resp.StatusCode)
-	}
-	return nil
-}
-
-// loadUsersFromJSON loads users from a JSON file
-func (app *App) loadUsersFromJSON(filePath string) ([]TargetUser, error) {
-	app.logger.Debug("Loading users from JSON file: %s", filePath)
-	
 	var users []TargetUser
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			app.logger.Info("Users file does not exist, returning empty list")
-			return []TargetUser{}, nil
+	for rows.Next() {
+		var user TargetUser
+		err := rows.Scan(&user.Handle, &user.DID, &user.Followers, &user.SavedOn, &user.Followed)
+		if err != nil {
+			app.logger.Error("Failed to scan user: %v", err)
+			return nil, fmt.Errorf("failed to scan user: %w", err)
 		}
-		app.logger.Error("Failed to read users file: %v", err)
-		return nil, fmt.Errorf("failed to read users file: %w", err)
+		users = append(users, user)
+		app.logger.Trace("Loaded user: %+v", user)
 	}
-	if err := json.Unmarshal(data, &users); err != nil {
-		app.logger.Error("Failed to unmarshal users: %v", err)
-		return nil, fmt.Errorf("failed to unmarshal users: %w", err)
+
+	if err = rows.Err(); err != nil {
+		app.logger.Error("Error iterating rows: %v", err)
+		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
-	app.logger.Debug("Successfully loaded %d users from file", len(users))
+
+	app.logger.Debug("Successfully loaded %d users from database in %v", len(users), time.Since(startTime))
 	return users, nil
 }
 
-// saveUserToJSON saves users to a JSON file
-func (app *App) saveUserToJSON(newUser TargetUser, filePath string) error {
-	app.logger.Debug("Saving user to JSON file: %s", filePath)
+// saveUserToDB saves a user to the SQLite database
+func (app *App) saveUserToDB(user TargetUser) error {
+	app.logger.Debug("Saving user to database: %+v", user)
+	startTime := time.Now()
 	
-	users, err := app.loadUsersFromJSON(filePath)
+	// Use UPSERT to either insert or update the user
+	result, err := app.db.Exec(`
+		INSERT INTO users (handle, did, followers, saved_on, followed)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(handle) DO UPDATE SET
+			did = excluded.did,
+			followers = excluded.followers,
+			saved_on = excluded.saved_on,
+			followed = CASE 
+				WHEN users.followed = 1 THEN 1 
+				ELSE excluded.followed 
+			END
+	`, user.Handle, user.DID, user.Followers, user.SavedOn, user.Followed)
+	
 	if err != nil {
-		app.logger.Error("Failed to load existing users: %v", err)
-		return fmt.Errorf("failed to load existing users: %w", err)
+		app.logger.Error("Failed to save user: %v", err)
+		return fmt.Errorf("failed to save user: %w", err)
 	}
-	
-	// Check if user exists and update it, otherwise append
-	found := false
-	for i, u := range users {
-		if u.Handle == newUser.Handle || u.DID == newUser.DID {
-			// Preserve the followed status if it's already set
-			if u.Followed {
-				newUser.Followed = true
-			}
-			users[i] = newUser
-			found = true
-			app.logger.Debug("Updated existing user: %s", newUser.Handle)
-			break
-		}
-	}
-	
-	if !found {
-		users = append(users, newUser)
-		app.logger.Debug("Added new user: %s", newUser.Handle)
-	}
-	
-	sort.Slice(users, func(i, j int) bool {
-		return users[i].Followers > users[j].Followers
-	})
-	
-	data, err := json.MarshalIndent(users, "", "  ")
-	if err != nil {
-		app.logger.Error("Failed to marshal users: %v", err)
-		return fmt.Errorf("failed to marshal users: %w", err)
-	}
-	
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		app.logger.Error("Failed to write users file: %v", err)
-		return fmt.Errorf("failed to write users file: %w", err)
-	}
-	
-	app.logger.Debug("Successfully saved users to file")
+
+	rowsAffected, _ := result.RowsAffected()
+	app.logger.Debug("Successfully saved user to database in %v (rows affected: %d)", time.Since(startTime), rowsAffected)
+	app.logger.Audit("User saved/updated: %s (followers: %d, followed: %v)", user.Handle, user.Followers, user.Followed)
 	return nil
 }
 
@@ -428,16 +393,16 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 }
 
 // fetchAndSaveTopUsers fetches and saves top users
-func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
-	app.logger.Info("Starting to fetch and save top users to: %s", filePath)
+func (app *App) fetchAndSaveTopUsers(simulate bool) error {
+	app.logger.Info("Starting to fetch and save top users to database")
 	
 	// Load existing users
-	existingUsers, err := app.loadUsersFromJSON(filePath)
+	existingUsers, err := app.loadUsersFromDB()
 	if err != nil {
 		app.logger.Error("Failed to load existing users: %v", err)
 		return fmt.Errorf("failed to load existing users: %w", err)
 	}
-	app.logger.Info("Loaded %d existing users from file", len(existingUsers))
+	app.logger.Info("Loaded %d existing users from database", len(existingUsers))
 
 	// Get a session to authenticate all requests
 	session, err := app.login()
@@ -481,7 +446,7 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 			SavedOn:   time.Now().Format(time.RFC3339),
 		}
 
-		if err := app.saveUserToJSON(newUser, filePath); err != nil {
+		if err := app.saveUserToDB(newUser); err != nil {
 			app.logger.Error("Failed to save user %s: %v", handle, err)
 			return fmt.Errorf("failed to save user %s: %w", handle, err)
 		}
@@ -489,6 +454,82 @@ func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
 	}
 
 	app.logger.Info("Completed fetching and saving top users")
+	return nil
+}
+
+// followUser follows a user on Bluesky
+func (app *App) followUser(session *Session, handleOrDid string, simulate bool) error {
+	app.logger.Info("Attempting to follow user: %s (simulate=%v)", handleOrDid, simulate)
+	startTime := time.Now()
+	
+	// Check if user is already being followed in memory
+	if app.followed[handleOrDid] {
+		app.logger.Info("Already followed %s in memory (skipped)", handleOrDid)
+		return nil
+	}
+
+	// Check if user is already being followed in the database
+	var followed bool
+	err := app.db.QueryRow("SELECT followed FROM users WHERE handle = ? OR did = ?", handleOrDid, handleOrDid).Scan(&followed)
+	if err == nil && followed {
+		app.logger.Info("User %s is already marked as followed in database (skipped)", handleOrDid)
+		app.followed[handleOrDid] = true
+		return nil
+	}
+
+	if simulate {
+		app.logger.Info("Simulation mode: would follow: %s", handleOrDid)
+		return nil
+	}
+
+	app.logger.Debug("Preparing follow request for %s", handleOrDid)
+	payload := map[string]interface{}{
+		"collection": "app.bsky.graph.follow",
+		"repo":       session.Did,
+		"record":     FollowRecord{Subject: handleOrDid},
+	}
+
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		app.logger.Error("Failed to marshal follow request: %v", err)
+		return fmt.Errorf("failed to marshal follow request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", apiBase+"/com.atproto.repo.createRecord", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		app.logger.Error("Failed to create follow request: %v", err)
+		return fmt.Errorf("failed to create follow request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+	req.Header.Set("Content-Type", "application/json")
+
+	app.logger.Debug("Sending follow request for %s", handleOrDid)
+	resp, err := app.client.Do(req)
+	if err != nil {
+		app.logger.Error("Failed to execute follow request: %v", err)
+		return fmt.Errorf("failed to execute follow request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		app.logger.Info("Successfully followed: %s (took %v)", handleOrDid, time.Since(startTime))
+		app.followed[handleOrDid] = true
+		
+		// Update the user's followed status in the database
+		_, err := app.db.Exec("UPDATE users SET followed = 1 WHERE handle = ? OR did = ?", handleOrDid, handleOrDid)
+		if err != nil {
+			app.logger.Error("Failed to update user's followed status: %v", err)
+			return fmt.Errorf("failed to update user's followed status: %w", err)
+		}
+		app.logger.Audit("User followed: %s", handleOrDid)
+	} else if resp.StatusCode == http.StatusBadRequest {
+		app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
+		app.followed[handleOrDid] = true
+		return nil
+	} else {
+		app.logger.Error("Failed to follow %s. Status: %d (took %v)", handleOrDid, resp.StatusCode, time.Since(startTime))
+		return fmt.Errorf("failed to follow %s. Status: %d", handleOrDid, resp.StatusCode)
+	}
 	return nil
 }
 
@@ -500,8 +541,7 @@ func main() {
 
 	// Parse command line flags
 	simulate := flag.Bool("simulate", false, "Simulate actions without making actual changes")
-	filePath := flag.String("file", "users.json", "Path to the users JSON file")
-	updateTop := flag.Bool("update-top", false, "Fetch top users from bsky.directory and save to JSON")
+	updateTop := flag.Bool("update-top", false, "Fetch top users from bsky.directory and save to database")
 	minFollowers := flag.String("min-followers", "0", "Minimum followers required to follow")
 	realFollow := flag.Bool("real", false, "Actually follow users (default is simulation only)")
 	flag.Parse()
@@ -512,20 +552,25 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	app := NewApp(config)
+	app, err := NewApp(config)
+	if err != nil {
+		log.Fatalf("Failed to create application: %v", err)
+	}
+	defer app.db.Close()
+
 	app.logger.Info("Starting Bluesky follower application")
 	app.logger.Info("Configuration loaded: timeout=%v, simulate=%v", config.Timeout, *simulate)
 
 	if *updateTop {
-		if err := app.fetchAndSaveTopUsers(*filePath, *simulate); err != nil {
+		if err := app.fetchAndSaveTopUsers(*simulate); err != nil {
 			app.logger.Error("Failed to fetch and save top users: %v", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	// Load users from JSON
-	users, err := app.loadUsersFromJSON(*filePath)
+	// Load users from database
+	users, err := app.loadUsersFromDB()
 	if err != nil {
 		app.logger.Error("Failed to load users: %v", err)
 		os.Exit(1)
@@ -568,7 +613,7 @@ func main() {
 			}
 			user.Followers = count
 			user.SavedOn = time.Now().UTC().Format(time.RFC3339)
-			if err := app.saveUserToJSON(user, *filePath); err != nil {
+			if err := app.saveUserToDB(user); err != nil {
 				app.logger.Error("Failed to save updated user %s: %v", actor, err)
 			}
 		}
