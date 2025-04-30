@@ -586,7 +586,14 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 
 	// Check if user is already being followed in the database
 	var followed bool
-	err := app.db.QueryRow("SELECT followed FROM users WHERE handle = ? OR did = ?", handleOrDid, handleOrDid).Scan(&followed)
+	var did string
+	err := app.db.QueryRow(`
+		SELECT followed, did 
+		FROM users 
+		WHERE handle = ? OR did = ? 
+		LIMIT 1
+	`, handleOrDid, handleOrDid).Scan(&followed, &did)
+	
 	if err == nil && followed {
 		app.logger.Info("User %s is already marked as followed in database (skipped)", handleOrDid)
 		app.followed[handleOrDid] = true
@@ -598,15 +605,16 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 		return nil
 	}
 
-	// Get the DID if we only have a handle
-	did := handleOrDid
-	if !strings.HasPrefix(handleOrDid, "did:") {
+	// Get the DID if we only have a handle and don't already have it
+	if !strings.HasPrefix(handleOrDid, "did:") && did == "" {
 		var err error
 		did, err = app.getDID(session, handleOrDid)
 		if err != nil {
 			app.logger.Error("Failed to get DID for %s: %v", handleOrDid, err)
 			return fmt.Errorf("failed to get DID for %s: %w", handleOrDid, err)
 		}
+	} else if did == "" {
+		did = handleOrDid
 	}
 
 	app.logger.Debug("Preparing follow request for %s (DID: %s)", handleOrDid, did)
@@ -656,27 +664,30 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 		app.followed[handleOrDid] = true
 		
 		// Update the user's followed status in the database
-		_, err := app.db.Exec("UPDATE users SET followed = 1, did = ? WHERE handle = ?", did, handleOrDid)
+		_, err := app.db.Exec(`
+			UPDATE users 
+			SET followed = 1, did = ? 
+			WHERE handle = ? OR did = ?
+		`, did, handleOrDid, handleOrDid)
 		if err != nil {
 			app.logger.Error("Failed to update user's followed status: %v", err)
 			return fmt.Errorf("failed to update user's followed status: %w", err)
 		}
 		app.logger.Audit("User followed: %s (DID: %s)", handleOrDid, did)
-	} else if resp.StatusCode == http.StatusBadRequest {
-		// Check if the error indicates we're already following
-		if strings.Contains(string(body), "already following") {
-			app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
-			app.followed[handleOrDid] = true
-			
-			// Update the database to reflect we're already following
-			_, err := app.db.Exec("UPDATE users SET followed = 1, did = ? WHERE handle = ?", did, handleOrDid)
-			if err != nil {
-				app.logger.Error("Failed to update user's followed status: %v", err)
-			}
-			return nil
+	} else if strings.Contains(string(body), "already following") {
+		app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
+		app.followed[handleOrDid] = true
+		
+		// Update the database to reflect we're already following
+		_, err := app.db.Exec(`
+			UPDATE users 
+			SET followed = 1, did = ? 
+			WHERE handle = ? OR did = ?
+		`, did, handleOrDid, handleOrDid)
+		if err != nil {
+			app.logger.Error("Failed to update user's followed status: %v", err)
 		}
-		app.logger.Error("Bad request when following %s: %s", handleOrDid, string(body))
-		return fmt.Errorf("bad request when following %s: %s", handleOrDid, string(body))
+		return nil
 	} else {
 		app.logger.Error("Failed to follow %s. Status: %d, Response: %s (took %v)", handleOrDid, resp.StatusCode, string(body), time.Since(startTime))
 		return fmt.Errorf("failed to follow %s. Status: %d, Response: %s", handleOrDid, resp.StatusCode, string(body))

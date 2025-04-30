@@ -140,6 +140,14 @@ To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
 
 ## 📅 Version History
 
+### v1.1.0 (2024-05-15)
+
+- ✨ Added enhanced user filtering capabilities
+- 🚀 Improved performance with optimized database queries
+- 🛠️ Fixed rate limiting issues
+- 📊 Added detailed statistics tracking
+- 🔄 Improved error recovery mechanisms
+
 ### v1.0.0 (2024-04-30)
 
 - 🎉 Initial stable release
@@ -160,12 +168,15 @@ The script logs in using your handle/email and app password and fetches your DID
 
 ## 🚀 Planned Features
 
-- 🚨 Better error handling + logging
-- 📈 Dynamic trending user fetch
-- 📤 Export/import database functionality
-- 💾 Backup and restore functionality
-- 📦 Batch processing for large user lists
-- ⚙️ Customizable rate limiting
+- 📈 Dynamic trending user fetch with customizable filters
+- 📤 Export/import database functionality with JSON/CSV support
+- 💾 Automated backup and restore functionality
+- 📦 Batch processing for large user lists with progress tracking
+- ⚙️ Customizable rate limiting based on API response headers
+- 🔍 Advanced user search and filtering capabilities
+- 📊 Enhanced analytics dashboard
+- 🔄 Real-time follower count updates
+- 🎯 Smart following recommendations based on user interests
 
 ---
 
