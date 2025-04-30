@@ -2,34 +2,52 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
-const apiBase = "https://bsky.social/xrpc"
+const (
+	apiBase = "https://bsky.social/xrpc"
+	defaultTimeout = 10 * time.Second
+)
 
+// Config holds application configuration
+type Config struct {
+	Identifier string
+	Password   string
+	Timeout    time.Duration
+	FallbackHandles []string // Configurable fallback handles
+}
+
+// Session represents an authenticated Bluesky session
 type Session struct {
 	AccessJwt string `json:"accessJwt"`
 	Did       string `json:"did"`
 	Handle    string `json:"handle"`
 }
 
+// Profile represents a user's profile information
 type Profile struct {
 	FollowersCount int `json:"followersCount"`
 }
 
+// FollowRecord represents a follow action
 type FollowRecord struct {
 	Subject string `json:"subject"`
 }
 
+// TargetUser represents a user to follow
 type TargetUser struct {
 	Handle    string `json:"handle"`
 	DID       string `json:"did"`
@@ -37,44 +55,123 @@ type TargetUser struct {
 	SavedOn   string `json:"savedOn"`
 }
 
-var followed = map[string]bool{}
+// App represents the application state
+type App struct {
+	config   *Config
+	client   *http.Client
+	followed map[string]bool
+}
 
-func login(identifier, password string) (*Session, error) {
-	body := map[string]string{
-		"identifier": identifier,
-		"password":   password,
+// NewApp creates a new application instance
+func NewApp(config *Config) *App {
+	return &App{
+		config:   config,
+		client: &http.Client{
+			Timeout: config.Timeout,
+		},
+		followed: make(map[string]bool),
 	}
-	jsonBody, _ := json.Marshal(body)
-	resp, err := http.Post(apiBase+"/com.atproto.server.createSession", "application/json", bytes.NewBuffer(jsonBody))
+}
+
+// loadConfig loads configuration from environment variables
+func loadConfig() (*Config, error) {
+	// Try to load .env file, but don't fail if it doesn't exist
+	_ = godotenv.Load()
+
+	identifier := os.Getenv("BSKY_IDENTIFIER")
+	password := os.Getenv("BSKY_PASSWORD")
+	
+	if identifier == "" || password == "" {
+		return nil, fmt.Errorf("BSKY_IDENTIFIER and BSKY_PASSWORD environment variables must be set")
+	}
+
+	// Load fallback handles from environment variable if available
+	var fallbackHandles []string
+	if fallbackEnv := os.Getenv("BSKY_FALLBACK_HANDLES"); fallbackEnv != "" {
+		fallbackHandles = strings.Split(fallbackEnv, ",")
+	}
+
+	// Parse timeout from environment variable
+	timeout := defaultTimeout
+	if timeoutStr := os.Getenv("BSKY_TIMEOUT"); timeoutStr != "" {
+		if timeoutSec, err := strconv.Atoi(timeoutStr); err == nil && timeoutSec > 0 {
+			timeout = time.Duration(timeoutSec) * time.Second
+		}
+	}
+	
+	return &Config{
+		Identifier: identifier,
+		Password:   password,
+		Timeout:    timeout,
+		FallbackHandles: fallbackHandles,
+	}, nil
+}
+
+// login authenticates with the Bluesky API
+func (app *App) login() (*Session, error) {
+	body := map[string]string{
+		"identifier": app.config.Identifier,
+		"password":   app.config.Password,
+	}
+	
+	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal login request: %w", err)
+	}
+	
+	req, err := http.NewRequest("POST", apiBase+"/com.atproto.server.createSession", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create login request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := app.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute login request: %w", err)
 	}
 	defer resp.Body.Close()
-
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("login failed with status: %d", resp.StatusCode)
+	}
+	
 	var session Session
 	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode login response: %w", err)
 	}
+	
 	return &session, nil
 }
 
-func getFollowerCount(actor string) (int, error) {
+// getFollowerCount retrieves the follower count for a user
+func (app *App) getFollowerCount(actor string) (int, error) {
 	url := apiBase + "/app.bsky.actor.getProfile?actor=" + actor
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to create profile request: %w", err)
+	}
+	
+	resp, err := app.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch profile: %w", err)
 	}
 	defer resp.Body.Close()
-
+	
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("profile fetch failed with status: %d", resp.StatusCode)
+	}
+	
 	var profile Profile
 	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to decode profile response: %w", err)
 	}
+	
 	return profile.FollowersCount, nil
 }
 
-func followUser(session *Session, handleOrDid string, simulate bool) error {
-	if followed[handleOrDid] {
+// followUser follows a user on Bluesky
+func (app *App) followUser(session *Session, handleOrDid string, simulate bool) error {
+	if app.followed[handleOrDid] {
 		fmt.Printf("Already followed %s (skipped)\n", handleOrDid)
 		return nil
 	}
@@ -90,48 +187,59 @@ func followUser(session *Session, handleOrDid string, simulate bool) error {
 		"record":     FollowRecord{Subject: handleOrDid},
 	}
 
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", apiBase+"/com.atproto.repo.createRecord", bytes.NewBuffer(body))
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal follow request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", apiBase+"/com.atproto.repo.createRecord", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return fmt.Errorf("failed to create follow request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := app.client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to execute follow request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 200 {
+	if resp.StatusCode == http.StatusOK {
 		fmt.Println("✅ Followed:", handleOrDid)
-		followed[handleOrDid] = true
-	} else if resp.StatusCode == 400 {
+		app.followed[handleOrDid] = true
+	} else if resp.StatusCode == http.StatusBadRequest {
 		fmt.Printf("ℹ️ Already following: %s\n", handleOrDid)
-		followed[handleOrDid] = true
+		app.followed[handleOrDid] = true
 		return nil
 	} else {
-		fmt.Printf("❌ Failed to follow %s. Status: %d\n", handleOrDid, resp.StatusCode)
+		return fmt.Errorf("failed to follow %s. Status: %d", handleOrDid, resp.StatusCode)
 	}
 	return nil
 }
 
-func loadUsersFromJSON(filePath string) ([]TargetUser, error) {
+// loadUsersFromJSON loads users from a JSON file
+func (app *App) loadUsersFromJSON(filePath string) ([]TargetUser, error) {
 	var users []TargetUser
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []TargetUser{}, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("failed to read users file: %w", err)
 	}
 	if err := json.Unmarshal(data, &users); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal users: %w", err)
 	}
 	return users, nil
 }
 
-func saveUserToJSON(newUser TargetUser, filePath string) error {
-	users, _ := loadUsersFromJSON(filePath)
+// saveUserToJSON saves users to a JSON file
+func (app *App) saveUserToJSON(newUser TargetUser, filePath string) error {
+	users, err := app.loadUsersFromJSON(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to load existing users: %w", err)
+	}
 	
 	// Check if user exists and update it, otherwise append
 	found := false
@@ -150,20 +258,36 @@ func saveUserToJSON(newUser TargetUser, filePath string) error {
 	sort.Slice(users, func(i, j int) bool {
 		return users[i].Followers > users[j].Followers
 	})
+	
 	data, err := json.MarshalIndent(users, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal users: %w", err)
 	}
-	return ioutil.WriteFile(filePath, data, 0644)
+	
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write users file: %w", err)
+	}
+	
+	return nil
 }
 
-func fetchTopHandlesFromBskyDirectory() ([]string, error) {
+// fetchTopHandlesFromBskyDirectory fetches top handles from Bluesky directory
+func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	url := apiBase + "/app.bsky.actor.getSuggestions?limit=50"
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch from Bluesky API: %v", err)
+		return nil, fmt.Errorf("failed to create suggestions request: %w", err)
+	}
+
+	resp, err := app.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch from Bluesky API: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("suggestions fetch failed with status: %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Actors []struct {
@@ -172,7 +296,7 @@ func fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	var handles []string
@@ -186,40 +310,34 @@ func fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	}
 
 	if len(handles) == 0 {
-		// Fallback to team members if no suggestions found
-		teamHandles := []string{
-			"jay.bsky.social",
-			"dwr.bsky.social",
-			"mikko.bsky.social",
-			"maggieappleton.bsky.social",
-			"theblaze.bsky.social",
+		if len(app.config.FallbackHandles) == 0 {
+			return nil, fmt.Errorf("no handles found and no fallback handles configured")
 		}
-		return teamHandles, nil
+		log.Printf("No handles found from API, using configured fallback handles")
+		return app.config.FallbackHandles, nil
 	}
 
 	return handles, nil
 }
 
-func fetchAndSaveTopUsers(filePath string) error {
-	// First, we need to authenticate
-	identifier := os.Getenv("BSKY_IDENTIFIER")
-	password := os.Getenv("BSKY_PASSWORD")
-	if identifier == "" || password == "" {
-		return fmt.Errorf("BSKY_IDENTIFIER and BSKY_PASSWORD environment variables must be set")
+// fetchAndSaveTopUsers fetches and saves top users
+func (app *App) fetchAndSaveTopUsers(filePath string, simulate bool) error {
+	session, err := app.login()
+	if err != nil {
+		return fmt.Errorf("failed to login: %w", err)
 	}
 
-	session, err := login(identifier, password)
+	handles, err := app.fetchTopHandlesFromBskyDirectory()
 	if err != nil {
-		return fmt.Errorf("failed to login: %v", err)
-	}
-
-	handles, err := fetchTopHandlesFromBskyDirectory()
-	if err != nil {
-		return fmt.Errorf("failed to fetch handles: %v", err)
+		return fmt.Errorf("failed to fetch handles: %w", err)
 	}
 
 	// Load existing users first
-	existingUsers, _ := loadUsersFromJSON(filePath)
+	existingUsers, err := app.loadUsersFromJSON(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to load existing users: %w", err)
+	}
+	
 	existingUsersMap := make(map[string]TargetUser)
 	for _, user := range existingUsers {
 		existingUsersMap[user.Handle] = user
@@ -230,127 +348,106 @@ func fetchAndSaveTopUsers(filePath string) error {
 	for _, handle := range handles {
 		time.Sleep(1 * time.Second) // Rate limiting
 
+		ctx, cancel := context.WithTimeout(context.Background(), app.config.Timeout)
+		defer cancel()
+
 		url := apiBase + "/app.bsky.actor.getProfile?actor=" + handle
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			log.Printf("Error creating request for %s: %v", handle, err)
 			continue
 		}
 		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 
-		client := &http.Client{}
-		resp, err := client.Do(req)
+		resp, err := app.client.Do(req)
 		if err != nil {
 			log.Printf("Error fetching profile for %s: %v", handle, err)
 			continue
 		}
 		defer resp.Body.Close()
 
-		// Read the raw response body for debugging
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Error reading response body for %s: %v", handle, err)
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Error fetching profile for %s: status %d", handle, resp.StatusCode)
 			continue
 		}
-		log.Printf("Raw response for %s: %s", handle, string(body))
 
-		// Create a new reader from the body for decoding
-		reader := bytes.NewReader(body)
-		var profile struct {
-			DID            string `json:"did"`
-			FollowersCount int    `json:"followersCount"`
-			Handle         string `json:"handle"`
-		}
-		if err := json.NewDecoder(reader).Decode(&profile); err != nil {
-			log.Printf("Decode error for %s: %v", handle, err)
+		var profile Profile
+		if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+			log.Printf("Error decoding profile for %s: %v", handle, err)
 			continue
 		}
 
 		user := TargetUser{
-			Handle:    profile.Handle,
-			DID:       profile.DID,
+			Handle:    handle,
 			Followers: profile.FollowersCount,
 			SavedOn:   time.Now().UTC().Format(time.RFC3339),
 		}
+
 		allUsers = append(allUsers, user)
-		log.Printf("Collected: %s (%d followers)", handle, profile.FollowersCount)
 	}
 
-	// Merge with existing users
-	for _, existingUser := range existingUsers {
-		if _, exists := existingUsersMap[existingUser.Handle]; exists {
-			// Only keep existing users that weren't updated in this run
-			keep := true
-			for _, newUser := range allUsers {
-				if newUser.Handle == existingUser.Handle {
-					keep = false
-					break
-				}
-			}
-			if keep {
-				allUsers = append(allUsers, existingUser)
-			}
+	// Save all users
+	for _, user := range allUsers {
+		if err := app.saveUserToJSON(user, filePath); err != nil {
+			log.Printf("Error saving user %s: %v", user.Handle, err)
 		}
 	}
 
-	// Sort all users by follower count
-	sort.Slice(allUsers, func(i, j int) bool {
-		return allUsers[i].Followers > allUsers[j].Followers
-	})
-
-	// Save all users at once
-	data, err := json.MarshalIndent(allUsers, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal users: %v", err)
-	}
-	if err := ioutil.WriteFile(filePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write users file: %v", err)
-	}
-
-	log.Printf("Successfully saved %d users to %s", len(allUsers), filePath)
 	return nil
 }
 
 func main() {
-	var identifier, password, jsonFile, minFollowersFlag string
-	var realFollow, pullTopUsers bool
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
 
-	flag.StringVar(&identifier, "id", "", "Bluesky handle or email")
-	flag.StringVar(&password, "pw", "", "App password")
-	flag.StringVar(&jsonFile, "json", "users.json", "Path to JSON file with users to follow")
-	flag.StringVar(&minFollowersFlag, "min-followers", "0", "Minimum followers")
+	app := NewApp(config)
+
+	// Parse command line flags
+	var (
+		simulate      bool
+		filePath      string
+		updateTop     bool
+		minFollowers  string
+		realFollow    bool
+	)
+
+	flag.BoolVar(&simulate, "simulate", false, "Run in simulation mode (no actual follows)")
+	flag.StringVar(&filePath, "file", "users.json", "Path to the users JSON file")
+	flag.BoolVar(&updateTop, "update-top", false, "Fetch top users from bsky.directory and save to JSON")
+	flag.StringVar(&minFollowers, "min-followers", "0", "Minimum followers required to follow")
 	flag.BoolVar(&realFollow, "real", false, "Actually follow users (default is simulation only)")
-	flag.BoolVar(&pullTopUsers, "update-top", false, "Fetch top users from bsky.directory and save to JSON")
 	flag.Parse()
 
-	if pullTopUsers {
-		if err := fetchAndSaveTopUsers(jsonFile); err != nil {
-			log.Fatalf("Failed to fetch top users: %v", err)
+	if updateTop {
+		if err := app.fetchAndSaveTopUsers(filePath, simulate); err != nil {
+			log.Fatalf("Failed to fetch and save top users: %v", err)
 		}
 		return
 	}
 
-	if identifier == "" || password == "" {
-		log.Fatal("Must pass --id and --pw")
-	}
-
-	session, err := login(identifier, password)
+	// Load users from JSON
+	users, err := app.loadUsersFromJSON(filePath)
 	if err != nil {
-		log.Fatal("Login failed:", err)
+		log.Fatalf("Failed to load users: %v", err)
 	}
 
-	users, err := loadUsersFromJSON(jsonFile)
+	// Parse minimum followers
+	minFollowersCount, err := strconv.Atoi(minFollowers)
 	if err != nil {
-		log.Fatalf("Error loading users: %v", err)
+		log.Fatalf("Invalid minimum followers value: %v", err)
 	}
 
-	minFollowers, err := strconv.Atoi(minFollowersFlag)
+	// Login to get session
+	session, err := app.login()
 	if err != nil {
-		log.Fatalf("Invalid --min-followers value: %v", err)
+		log.Fatalf("Failed to login: %v", err)
 	}
 
+	// Process each user
 	for _, user := range users {
-		time.Sleep(3 * time.Second)
+		time.Sleep(3 * time.Second) // Rate limiting
 
 		actor := user.Handle
 		if actor == "" {
@@ -361,24 +458,29 @@ func main() {
 			continue
 		}
 
+		// Update follower count if needed
 		count := user.Followers
 		if count == 0 {
-			count, err = getFollowerCount(actor)
+			count, err = app.getFollowerCount(actor)
 			if err != nil {
 				log.Printf("Skipping %s (error getting follower count: %v)", actor, err)
 				continue
 			}
 			user.Followers = count
 			user.SavedOn = time.Now().UTC().Format(time.RFC3339)
-			saveUserToJSON(user, jsonFile)
+			if err := app.saveUserToJSON(user, filePath); err != nil {
+				log.Printf("Failed to save updated user %s: %v", actor, err)
+			}
 		}
 
-		if count < minFollowers {
-			fmt.Printf("⏭️  Skipping %s (%d < min %d)\n", actor, count, minFollowers)
+		// Skip if below minimum followers
+		if count < minFollowersCount {
+			fmt.Printf("⏭️  Skipping %s (%d < min %d)\n", actor, count, minFollowersCount)
 			continue
 		}
 
-		if err := followUser(session, actor, !realFollow); err != nil {
+		// Follow user
+		if err := app.followUser(session, actor, !realFollow); err != nil {
 			log.Printf("Follow error: %v", err)
 		}
 	}
