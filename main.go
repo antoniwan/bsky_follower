@@ -120,7 +120,7 @@ func loadUsersFromJSON(filePath string) ([]TargetUser, error) {
 	data, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []TargetUser{}, nil // treat as empty
+			return []TargetUser{}, nil
 		}
 		return nil, err
 	}
@@ -134,7 +134,7 @@ func saveUserToJSON(newUser TargetUser, filePath string) error {
 	users, _ := loadUsersFromJSON(filePath)
 	for _, u := range users {
 		if u.Handle == newUser.Handle || u.DID == newUser.DID {
-			return nil // skip if exists
+			return nil
 		}
 	}
 	users = append(users, newUser)
@@ -148,16 +148,70 @@ func saveUserToJSON(newUser TargetUser, filePath string) error {
 	return ioutil.WriteFile(filePath, data, 0644)
 }
 
+func fetchTopHandlesFromBskyDirectory() []string {
+	return []string{
+		"jay.bsky.social",
+		"dwr.bsky.social",
+		"mikko.bsky.social",
+		"maggieappleton.bsky.social",
+		"theblaze.bsky.social",
+	}
+}
+
+func fetchAndSaveTopUsers(filePath string) error {
+	handles := fetchTopHandlesFromBskyDirectory()
+	for _, handle := range handles {
+		url := apiBase + "/app.bsky.actor.getProfile?actor=" + handle
+		resp, err := http.Get(url)
+		if err != nil {
+			log.Printf("Error fetching profile for %s: %v", handle, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		var profile struct {
+			DID            string `json:"did"`
+			FollowersCount int    `json:"followersCount"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+			log.Printf("Decode error for %s: %v", handle, err)
+			continue
+		}
+
+		user := TargetUser{
+			Handle:    handle,
+			DID:       profile.DID,
+			Followers: profile.FollowersCount,
+			SavedOn:   time.Now().UTC().Format(time.RFC3339),
+		}
+
+		if err := saveUserToJSON(user, filePath); err != nil {
+			log.Printf("Error saving user %s: %v", handle, err)
+		} else {
+			log.Printf("Saved: %s (%d followers)", handle, profile.FollowersCount)
+		}
+	}
+	return nil
+}
+
 func main() {
 	var identifier, password, jsonFile, minFollowersFlag string
-	var realFollow bool
+	var realFollow, pullTopUsers bool
 
 	flag.StringVar(&identifier, "id", "", "Bluesky handle or email")
 	flag.StringVar(&password, "pw", "", "App password")
 	flag.StringVar(&jsonFile, "json", "users.json", "Path to JSON file with users to follow")
 	flag.StringVar(&minFollowersFlag, "min-followers", "0", "Minimum followers")
 	flag.BoolVar(&realFollow, "real", false, "Actually follow users (default is simulation only)")
+	flag.BoolVar(&pullTopUsers, "update-top", false, "Fetch top users from bsky.directory and save to JSON")
 	flag.Parse()
+
+	if pullTopUsers {
+		if err := fetchAndSaveTopUsers(jsonFile); err != nil {
+			log.Fatalf("Failed to fetch top users: %v", err)
+		}
+		return
+	}
 
 	if identifier == "" || password == "" {
 		log.Fatal("Must pass --id and --pw")
