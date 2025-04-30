@@ -457,6 +457,42 @@ func (app *App) fetchAndSaveTopUsers(simulate bool) error {
 	return nil
 }
 
+// getDID retrieves the DID for a given handle
+func (app *App) getDID(session *Session, handle string) (string, error) {
+	app.logger.Debug("Getting DID for handle: %s", handle)
+	
+	url := apiBase + "/app.bsky.actor.getProfile?actor=" + handle
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		app.logger.Error("Failed to create profile request: %v", err)
+		return "", fmt.Errorf("failed to create profile request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
+	
+	resp, err := app.client.Do(req)
+	if err != nil {
+		app.logger.Error("Failed to fetch profile: %v", err)
+		return "", fmt.Errorf("failed to fetch profile: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		app.logger.Error("Profile fetch failed with status: %d", resp.StatusCode)
+		return "", fmt.Errorf("profile fetch failed with status: %d", resp.StatusCode)
+	}
+	
+	var result struct {
+		Did string `json:"did"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		app.logger.Error("Failed to decode profile response: %v", err)
+		return "", fmt.Errorf("failed to decode profile response: %w", err)
+	}
+	
+	app.logger.Debug("Got DID for %s: %s", handle, result.Did)
+	return result.Did, nil
+}
+
 // followUser follows a user on Bluesky
 func (app *App) followUser(session *Session, handleOrDid string, simulate bool) error {
 	app.logger.Info("Attempting to follow user: %s (simulate=%v)", handleOrDid, simulate)
@@ -482,11 +518,30 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 		return nil
 	}
 
-	app.logger.Debug("Preparing follow request for %s", handleOrDid)
+	// Get the DID if we only have a handle
+	did := handleOrDid
+	if !strings.HasPrefix(handleOrDid, "did:") {
+		var err error
+		did, err = app.getDID(session, handleOrDid)
+		if err != nil {
+			app.logger.Error("Failed to get DID for %s: %v", handleOrDid, err)
+			return fmt.Errorf("failed to get DID for %s: %w", handleOrDid, err)
+		}
+	}
+
+	app.logger.Debug("Preparing follow request for %s (DID: %s)", handleOrDid, did)
+	
+	// Create the follow record with proper structure
+	followRecord := map[string]interface{}{
+		"$type": "app.bsky.graph.follow",
+		"subject": did,
+		"createdAt": time.Now().Format(time.RFC3339),
+	}
+
 	payload := map[string]interface{}{
 		"collection": "app.bsky.graph.follow",
 		"repo":       session.Did,
-		"record":     FollowRecord{Subject: handleOrDid},
+		"record":     followRecord,
 	}
 
 	jsonBody, err := json.Marshal(payload)
@@ -500,10 +555,11 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 		app.logger.Error("Failed to create follow request: %v", err)
 		return fmt.Errorf("failed to create follow request: %w", err)
 	}
+	
 	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 	req.Header.Set("Content-Type", "application/json")
 
-	app.logger.Debug("Sending follow request for %s", handleOrDid)
+	app.logger.Debug("Sending follow request for %s (DID: %s)", handleOrDid, did)
 	resp, err := app.client.Do(req)
 	if err != nil {
 		app.logger.Error("Failed to execute follow request: %v", err)
@@ -511,24 +567,39 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 	}
 	defer resp.Body.Close()
 
+	// Read and log the response body for debugging
+	body, _ := io.ReadAll(resp.Body)
+	app.logger.Debug("Follow response for %s: Status=%d, Body=%s", handleOrDid, resp.StatusCode, string(body))
+
 	if resp.StatusCode == http.StatusOK {
 		app.logger.Info("Successfully followed: %s (took %v)", handleOrDid, time.Since(startTime))
 		app.followed[handleOrDid] = true
 		
 		// Update the user's followed status in the database
-		_, err := app.db.Exec("UPDATE users SET followed = 1 WHERE handle = ? OR did = ?", handleOrDid, handleOrDid)
+		_, err := app.db.Exec("UPDATE users SET followed = 1, did = ? WHERE handle = ?", did, handleOrDid)
 		if err != nil {
 			app.logger.Error("Failed to update user's followed status: %v", err)
 			return fmt.Errorf("failed to update user's followed status: %w", err)
 		}
-		app.logger.Audit("User followed: %s", handleOrDid)
+		app.logger.Audit("User followed: %s (DID: %s)", handleOrDid, did)
 	} else if resp.StatusCode == http.StatusBadRequest {
-		app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
-		app.followed[handleOrDid] = true
-		return nil
+		// Check if the error indicates we're already following
+		if strings.Contains(string(body), "already following") {
+			app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
+			app.followed[handleOrDid] = true
+			
+			// Update the database to reflect we're already following
+			_, err := app.db.Exec("UPDATE users SET followed = 1, did = ? WHERE handle = ?", did, handleOrDid)
+			if err != nil {
+				app.logger.Error("Failed to update user's followed status: %v", err)
+			}
+			return nil
+		}
+		app.logger.Error("Bad request when following %s: %s", handleOrDid, string(body))
+		return fmt.Errorf("bad request when following %s: %s", handleOrDid, string(body))
 	} else {
-		app.logger.Error("Failed to follow %s. Status: %d (took %v)", handleOrDid, resp.StatusCode, time.Since(startTime))
-		return fmt.Errorf("failed to follow %s. Status: %d", handleOrDid, resp.StatusCode)
+		app.logger.Error("Failed to follow %s. Status: %d, Response: %s (took %v)", handleOrDid, resp.StatusCode, string(body), time.Since(startTime))
+		return fmt.Errorf("failed to follow %s. Status: %d, Response: %s", handleOrDid, resp.StatusCode, string(body))
 	}
 	return nil
 }
