@@ -1,27 +1,27 @@
-# Bluesky Follower
+# 🦋 Bluesky Follower
 
 A Go program to help manage following users on Bluesky social network.
 
-## Features
+## ✨ Features
 
-- Login to Bluesky using your credentials
-- Follow users from a database
-- Filter users by minimum follower count
-- Simulation mode to preview actions
-- Track already followed users
-- Update follower counts automatically
-- Fetch and save top users from Bluesky directory
-- Enhanced logging with debug mode
-- SQLite database for reliable data storage
-- Proper DID (Decentralized Identifier) handling
-- Rate limiting and error handling
+- 🔐 Login to Bluesky using your credentials
+- 👥 Follow users from a database
+- 🔍 Filter users by minimum follower count
+- 🎮 Simulation mode to preview actions
+- 📊 Track already followed users
+- 🔄 Update follower counts automatically
+- 📥 Fetch and save top users from Bluesky directory
+- 📝 Enhanced logging with debug mode
+- 💾 SQLite database for reliable data storage
+- 🆔 Proper DID (Decentralized Identifier) handling
+- ⏱️ Rate limiting and error handling
 
-## Requirements
+## 📋 Requirements
 
 - Go 1.16 or later
 - Bluesky account credentials
 
-## Setup
+## 🛠️ Setup
 
 1. Create a `.env` file in the project root with the following variables:
 
@@ -56,7 +56,7 @@ go mod download
 go run main.go
 ```
 
-## Usage
+## 🚀 Usage
 
 The application supports the following command-line flags:
 
@@ -65,7 +65,7 @@ The application supports the following command-line flags:
 - `-min-followers`: Minimum followers required to follow (default: 0)
 - `-real`: Actually follow users (default is simulation only)
 
-### Examples
+### 💡 Examples
 
 1. Fetch and save top users:
 
@@ -85,7 +85,7 @@ go run main.go --min-followers 1000 --real
 go run main.go --simulate
 ```
 
-## Data Storage
+## 💾 Data Storage
 
 The application uses SQLite for data storage. All user data is stored in `users.db` with the following schema:
 
@@ -107,7 +107,7 @@ Fields:
 - `saved_on`: Timestamp when the user was added
 - `followed`: Whether the user has been followed
 
-## Logging
+## 📝 Logging
 
 The application provides detailed logging with multiple levels:
 
@@ -120,7 +120,7 @@ The application provides detailed logging with multiple levels:
 
 To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
 
-## Environment Variables
+## ⚙️ Environment Variables
 
 - `BSKY_IDENTIFIER`: Your Bluesky handle or email
 - `BSKY_PASSWORD`: Your Bluesky app password
@@ -128,29 +128,29 @@ To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
 - `BSKY_TIMEOUT`: Request timeout in seconds (optional, default: 10)
 - `DEBUG_MODE`: Enable detailed logging (optional, default: false)
 
-## Notes
+## 📌 Notes
 
-- The program will skip users you're already following
-- Follower counts are automatically updated if not provided
-- A 3-second delay is added between operations to avoid rate limiting
-- The program tracks followed users in both memory and database
-- SQLite database provides reliable data storage and atomic updates
-- Proper DID handling ensures successful follows
-- Error handling for common Bluesky API issues
+- ⏭️ The program will skip users you're already following
+- 🔄 Follower counts are automatically updated if not provided
+- ⏱️ A 3-second delay is added between operations to avoid rate limiting
+- 📊 The program tracks followed users in both memory and database
+- 💾 SQLite database provides reliable data storage and atomic updates
+- 🆔 Proper DID handling ensures successful follows
+- ❌ Error handling for common Bluesky API issues
 
-## Version History
+## 📅 Version History
 
 ### v1.0.0 (2024-04-30)
 
-- Initial stable release
-- Fixed DID handling for follow operations
-- Improved error handling and logging
-- Added proper rate limiting
-- Enhanced database operations
+- 🎉 Initial stable release
+- 🛠️ Fixed DID handling for follow operations
+- 🚨 Improved error handling and logging
+- ⏱️ Added proper rate limiting
+- 💾 Enhanced database operations
 
 ---
 
-## 🌐 Auth Notes
+## 🔐 Auth Notes
 
 Bluesky uses **App Passwords**, which you can generate [here](https://bsky.app/settings/app-passwords). You do **not** need API keys or tokens.
 
@@ -158,22 +158,22 @@ The script logs in using your handle/email and app password and fetches your DID
 
 ---
 
-## 📈 Planned Features
+## 🚀 Planned Features
 
-- Better error handling + logging
-- Dynamic trending user fetch
-- Export/import database functionality
-- Backup and restore functionality
-- Batch processing for large user lists
-- Customizable rate limiting
+- 🚨 Better error handling + logging
+- 📈 Dynamic trending user fetch
+- 📤 Export/import database functionality
+- 💾 Backup and restore functionality
+- 📦 Batch processing for large user lists
+- ⚙️ Customizable rate limiting
 
 ---
 
 Built by [@antoniwan](https://github.com/antoniwan) 🛠️
 
-## Security Notes
+## 🔒 Security Notes
 
-- Never commit your `.env` file to version control
-- Keep your app password secure
-- The application uses SQLite for data storage - ensure proper file permissions
-- Debug mode should be disabled in production
+- 🚫 Never commit your `.env` file to version control
+- 🔐 Keep your app password secure
+- 💾 The application uses SQLite for data storage - ensure proper file permissions
+- 🐛 Debug mode should be disabled in production
