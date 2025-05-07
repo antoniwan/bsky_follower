@@ -11,18 +11,31 @@ var (
 	special   = lipgloss.AdaptiveColor{Light: "#43BF6D", Dark: "#73F59F"}
 
 	// Styles
-	titleStyle = lipgloss.NewStyle().
+	uiTitleStyle = lipgloss.NewStyle().
 		Bold(true).
-		Foreground(highlight).
-		PaddingLeft(2).
-		PaddingRight(2).
-		MarginBottom(1)
+		Foreground(lipgloss.Color("#FF69B4"))
 
-	subtitleStyle = lipgloss.NewStyle().
-		Foreground(special).
+	uiSubtitleStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#A9A9A9"))
+
+	uiMenuItemStyle = lipgloss.NewStyle().
+		PaddingLeft(2)
+
+	uiSelectedMenuItemStyle = lipgloss.NewStyle().
 		PaddingLeft(2).
-		PaddingRight(2).
-		MarginBottom(1)
+		Foreground(lipgloss.Color("#FF69B4")).
+		Bold(true)
+
+	uiDisabledMenuItemStyle = lipgloss.NewStyle().
+		PaddingLeft(2).
+		Foreground(lipgloss.Color("#808080"))
+
+	uiStatusStyle = lipgloss.NewStyle().
+		PaddingLeft(2).
+		Foreground(lipgloss.Color("#00FF00"))
+
+	uiHelpStyle = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#A9A9A9"))
 
 	infoStyle = lipgloss.NewStyle().
 		Foreground(subtle).
