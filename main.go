@@ -4,71 +4,30 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"container/heap"
+
+	"bsky_follower/v1.0.0/logger"
 
 	"github.com/joho/godotenv"
 	_ "modernc.org/sqlite"
 )
 
-// Logger provides structured logging capabilities
-type Logger struct {
-	*log.Logger
-	debugMode bool
-}
-
-// NewLogger creates a new logger instance
-func NewLogger(w io.Writer) *Logger {
-	return &Logger{
-		Logger:    log.New(w, "", log.Ldate|log.Ltime|log.Lmicroseconds),
-		debugMode: os.Getenv("DEBUG_MODE") == "true",
-	}
-}
-
-// Info logs an informational message
-func (l *Logger) Info(format string, v ...interface{}) {
-	l.Printf("[INFO] "+format, v...)
-}
-
-// Error logs an error message
-func (l *Logger) Error(format string, v ...interface{}) {
-	l.Printf("[ERROR] "+format, v...)
-}
-
-// Debug logs a debug message
-func (l *Logger) Debug(format string, v ...interface{}) {
-	if l.debugMode {
-		l.Printf("[DEBUG] "+format, v...)
-	}
-}
-
-// Warn logs a warning message
-func (l *Logger) Warn(format string, v ...interface{}) {
-	l.Printf("[WARN] "+format, v...)
-}
-
-// Audit logs an audit message
-func (l *Logger) Audit(format string, v ...interface{}) {
-	l.Printf("[AUDIT] "+format, v...)
-}
-
-// Trace logs a trace message
-func (l *Logger) Trace(format string, v ...interface{}) {
-	if l.debugMode {
-		l.Printf("[TRACE] "+format, v...)
-	}
-}
-
 const (
 	apiBase = "https://bsky.social/xrpc"
 	defaultTimeout = 10 * time.Second
+	maxFollowsPerHour = 50
+	maxRetries = 3
+	retryDelay = 5 * time.Minute
+	followCooldown = 24 * time.Hour
 )
 
 // Config holds application configuration
@@ -84,6 +43,7 @@ type Session struct {
 	AccessJwt string `json:"accessJwt"`
 	Did       string `json:"did"`
 	Handle    string `json:"handle"`
+	CreatedAt time.Time
 }
 
 // Profile represents a user's profile information
@@ -98,20 +58,41 @@ type FollowRecord struct {
 
 // TargetUser represents a user to follow
 type TargetUser struct {
-	Handle    string `json:"handle"`
-	DID       string `json:"did"`
-	Followers int    `json:"followers"`
-	SavedOn   string `json:"savedOn"`
-	Followed  bool   `json:"followed"`
+	Handle      string    `json:"handle"`
+	DID         string    `json:"did"`
+	Followers   int       `json:"followers"`
+	SavedOn     time.Time `json:"savedOn"`
+	Followed    bool      `json:"followed"`
+	LastChecked time.Time `json:"lastChecked"`
+	FollowDate  time.Time `json:"followDate"`
+	Priority    int       `json:"priority"`
+	Attempts    int       `json:"attempts"`
 }
+
+// FollowQueueItem represents an item in the follow queue
+type FollowQueueItem struct {
+	User      TargetUser
+	Priority  int
+	Attempts  int
+	NextTry   time.Time
+	index     int // for heap implementation
+}
+
+// FollowQueue implements heap.Interface for priority queue
+type FollowQueue []*FollowQueueItem
 
 // App represents the main application
 type App struct {
 	config   *Config
 	client   *http.Client
 	followed map[string]bool
-	logger   *Logger
+	logger   *logger.Logger
 	db       *sql.DB
+	queue    *FollowQueue
+	mu       sync.Mutex
+	lastFollow time.Time
+	followCount int
+	followReset time.Time
 }
 
 // NewApp creates a new application instance
@@ -121,13 +102,22 @@ func NewApp(config *Config) (*App, error) {
 		config:   config,
 		client:   &http.Client{Timeout: config.Timeout},
 		followed: make(map[string]bool),
-		logger:   NewLogger(os.Stdout),
+		logger:   logger.NewLogger(&logger.Config{
+			DebugMode:   os.Getenv("DEBUG_MODE") == "true",
+			LogToFile:   true,
+			LogFilePath: "logs/bsky_follower.log",
+			MaxSize:     100,    // 100MB
+			MaxBackups:  3,      // Keep 3 backup files
+			MaxAge:      7,      // Keep logs for 7 days
+			Compress:    true,   // Compress rotated logs
+			LogLevel:    "info", // Default to info level
+		}),
 	}
 
 	// Initialize database
 	db, err := sql.Open("sqlite", "users.db")
 	if err != nil {
-		app.logger.Error("Failed to open database: %v", err)
+		app.logger.Error("Failed to open database", "error", err)
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 	app.db = db
@@ -138,16 +128,20 @@ func NewApp(config *Config) (*App, error) {
 			handle TEXT PRIMARY KEY,
 			did TEXT,
 			followers INTEGER,
-			saved_on TEXT,
-			followed BOOLEAN
+			saved_on TIMESTAMP,
+			followed BOOLEAN,
+			last_checked TIMESTAMP,
+			follow_date TIMESTAMP,
+			priority INTEGER DEFAULT 1,
+			attempts INTEGER DEFAULT 0
 		)
 	`)
 	if err != nil {
-		app.logger.Error("Failed to create table: %v", err)
+		app.logger.Error("Failed to create table", "error", err)
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
 
-	app.logger.Info("Application initialized with debug mode: %v", app.logger.debugMode)
+	app.logger.Info("Application initialized", "debug_mode", app.logger.IsDebugMode())
 	app.logger.Debug("Database connection established")
 	return app, nil
 }
@@ -197,20 +191,20 @@ func (app *App) login() (*Session, error) {
 	
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		app.logger.Error("Failed to marshal login payload: %v", err)
+		app.logger.Error("Failed to marshal login payload", "error", err)
 		return nil, fmt.Errorf("failed to marshal login payload: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", apiBase+"/com.atproto.server.createSession", bytes.NewBuffer(jsonData))
 	if err != nil {
-		app.logger.Error("Failed to create login request: %v", err)
+		app.logger.Error("Failed to create login request", "error", err)
 		return nil, fmt.Errorf("failed to create login request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := app.client.Do(req)
 	if err != nil {
-		app.logger.Error("Failed to execute login request: %v", err)
+		app.logger.Error("Failed to execute login request", "error", err)
 		return nil, fmt.Errorf("failed to execute login request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -222,10 +216,11 @@ func (app *App) login() (*Session, error) {
 
 	var session Session
 	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
-		app.logger.Error("Failed to decode login response: %v", err)
+		app.logger.Error("Failed to decode login response", "error", err)
 		return nil, fmt.Errorf("failed to decode login response: %w", err)
 	}
 
+	session.CreatedAt = time.Now()
 	app.logger.Info("Successfully logged in as: %s (DID: %s)", session.Handle, session.Did)
 	return &session, nil
 }
@@ -237,14 +232,14 @@ func (app *App) getFollowerCount(session *Session, actor string) (int, error) {
 	url := apiBase + "/app.bsky.actor.getProfile?actor=" + actor
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		app.logger.Error("Failed to create profile request: %v", err)
+		app.logger.Error("Failed to create profile request", "error", err)
 		return 0, fmt.Errorf("failed to create profile request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 	
 	resp, err := app.client.Do(req)
 	if err != nil {
-		app.logger.Error("Failed to fetch profile: %v", err)
+		app.logger.Error("Failed to fetch profile", "error", err)
 		return 0, fmt.Errorf("failed to fetch profile: %w", err)
 	}
 	defer resp.Body.Close()
@@ -256,7 +251,7 @@ func (app *App) getFollowerCount(session *Session, actor string) (int, error) {
 	
 	var profile Profile
 	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
-		app.logger.Error("Failed to decode profile response: %v", err)
+		app.logger.Error("Failed to decode profile response", "error", err)
 		return 0, fmt.Errorf("failed to decode profile response: %w", err)
 	}
 	
@@ -269,9 +264,9 @@ func (app *App) loadUsersFromDB() ([]TargetUser, error) {
 	app.logger.Debug("Loading users from database")
 	startTime := time.Now()
 	
-	rows, err := app.db.Query("SELECT handle, did, followers, saved_on, followed FROM users")
+	rows, err := app.db.Query("SELECT handle, did, followers, saved_on, followed, last_checked, follow_date, priority, attempts FROM users")
 	if err != nil {
-		app.logger.Error("Failed to query users: %v", err)
+		app.logger.Error("Failed to query users", "error", err)
 		return nil, fmt.Errorf("failed to query users: %w", err)
 	}
 	defer rows.Close()
@@ -279,17 +274,30 @@ func (app *App) loadUsersFromDB() ([]TargetUser, error) {
 	var users []TargetUser
 	for rows.Next() {
 		var user TargetUser
-		err := rows.Scan(&user.Handle, &user.DID, &user.Followers, &user.SavedOn, &user.Followed)
+		var savedOn, lastChecked, followDate sql.NullString
+		err := rows.Scan(&user.Handle, &user.DID, &user.Followers, &savedOn, &user.Followed, &lastChecked, &followDate, &user.Priority, &user.Attempts)
 		if err != nil {
-			app.logger.Error("Failed to scan user: %v", err)
-			return nil, fmt.Errorf("failed to scan user: %w", err)
+			app.logger.Error("Failed to scan user", "error", err)
+			continue
 		}
+
+		// Parse timestamps
+		if savedOn.Valid {
+			user.SavedOn, _ = time.Parse(time.RFC3339, savedOn.String)
+		}
+		if lastChecked.Valid {
+			user.LastChecked, _ = time.Parse(time.RFC3339, lastChecked.String)
+		}
+		if followDate.Valid {
+			user.FollowDate, _ = time.Parse(time.RFC3339, followDate.String)
+		}
+
 		users = append(users, user)
-		app.logger.Trace("Loaded user: %+v", user)
+		app.logger.Trace("Loaded user", "user", user)
 	}
 
 	if err = rows.Err(); err != nil {
-		app.logger.Error("Error iterating rows: %v", err)
+		app.logger.Error("Error iterating rows", "error", err)
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
@@ -299,31 +307,26 @@ func (app *App) loadUsersFromDB() ([]TargetUser, error) {
 
 // saveUserToDB saves a user to the SQLite database
 func (app *App) saveUserToDB(user TargetUser) error {
-	app.logger.Debug("Saving user to database: %+v", user)
+	app.logger.Debug("Saving user to database", "user", user)
 	startTime := time.Now()
 	
 	// Use UPSERT to either insert or update the user
 	result, err := app.db.Exec(`
-		INSERT INTO users (handle, did, followers, saved_on, followed)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(handle) DO UPDATE SET
-			did = excluded.did,
-			followers = excluded.followers,
-			saved_on = excluded.saved_on,
-			followed = CASE 
-				WHEN users.followed = 1 THEN 1 
-				ELSE excluded.followed 
-			END
-	`, user.Handle, user.DID, user.Followers, user.SavedOn, user.Followed)
+		INSERT OR REPLACE INTO users (
+			handle, did, followers, saved_on, followed, 
+			last_checked, follow_date, priority, attempts
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, user.Handle, user.DID, user.Followers, user.SavedOn, user.Followed,
+		user.LastChecked, user.FollowDate, user.Priority, user.Attempts)
 	
 	if err != nil {
-		app.logger.Error("Failed to save user: %v", err)
+		app.logger.Error("Failed to save user", "error", err)
 		return fmt.Errorf("failed to save user: %w", err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	app.logger.Debug("Successfully saved user to database in %v (rows affected: %d)", time.Since(startTime), rowsAffected)
-	app.logger.Audit("User saved/updated: %s (followers: %d, followed: %v)", user.Handle, user.Followers, user.Followed)
+	app.logger.Audit("User saved/updated", "handle", user.Handle, "followers", user.Followers, "followed", user.Followed)
 	return nil
 }
 
@@ -334,7 +337,7 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	// First get a session to authenticate
 	session, err := app.login()
 	if err != nil {
-		app.logger.Error("Failed to login: %v", err)
+		app.logger.Error("Failed to login", "error", err)
 		return nil, fmt.Errorf("failed to login: %w", err)
 	}
 
@@ -357,7 +360,7 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	trendingURL := apiBase + "/app.bsky.unspecced.getPopular?limit=100"
 	req, err := http.NewRequest("GET", trendingURL, nil)
 	if err != nil {
-		app.logger.Error("Failed to create trending request: %v", err)
+		app.logger.Error("Failed to create trending request", "error", err)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 		resp, err := app.client.Do(req)
@@ -386,7 +389,7 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	dirURL := apiBase + "/app.bsky.actor.getSuggestions?limit=100"
 	req, err = http.NewRequest("GET", dirURL, nil)
 	if err != nil {
-		app.logger.Error("Failed to create suggestions request: %v", err)
+		app.logger.Error("Failed to create suggestions request", "error", err)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 		resp, err := app.client.Do(req)
@@ -415,7 +418,7 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	popularURL := apiBase + "/app.bsky.actor.searchActors?limit=100&sort=followerCount"
 	req, err = http.NewRequest("GET", popularURL, nil)
 	if err != nil {
-		app.logger.Error("Failed to create popular request: %v", err)
+		app.logger.Error("Failed to create popular request", "error", err)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 		resp, err := app.client.Do(req)
@@ -452,88 +455,86 @@ func (app *App) fetchTopHandlesFromBskyDirectory() ([]string, error) {
 	return allHandles, nil
 }
 
-// fetchAndSaveTopUsers fetches and saves top users
+// fetchAndSaveTopUsers fetches top users from bsky.directory and saves them to the database
 func (app *App) fetchAndSaveTopUsers(simulate bool) error {
-	app.logger.Info("Starting to fetch and save top users to database")
+	app.logger.Info("Fetching top users from bsky.directory")
 	
-	// Load existing users
-	existingUsers, err := app.loadUsersFromDB()
+	handles, err := app.fetchTopHandlesFromBskyDirectory()
 	if err != nil {
-		app.logger.Error("Failed to load existing users: %v", err)
-		return fmt.Errorf("failed to load existing users: %w", err)
+		return fmt.Errorf("failed to fetch top handles: %w", err)
 	}
-	app.logger.Info("Loaded %d existing users from database", len(existingUsers))
 
-	// Get a session to authenticate all requests
 	session, err := app.login()
 	if err != nil {
-		app.logger.Error("Failed to login: %v", err)
 		return fmt.Errorf("failed to login: %w", err)
 	}
 
-	// Check when we last updated users
-	var lastUpdate time.Time
-	err = app.db.QueryRow("SELECT MAX(saved_on) FROM users").Scan(&lastUpdate)
-	if err != nil {
-		app.logger.Warn("Could not determine last update time: %v", err)
-		lastUpdate = time.Now().Add(-24 * time.Hour) // Default to 24 hours ago
-	}
-
-	// Only fetch new users if it's been more than 6 hours since last update
-	if time.Since(lastUpdate) < 6*time.Hour {
-		app.logger.Info("Skipping fetch - last update was %v ago", time.Since(lastUpdate))
-		return nil
-	}
-
-	// Fetch top handles from multiple sources
-	app.logger.Info("Fetching top handles from multiple sources")
-	handles, err := app.fetchTopHandlesFromBskyDirectory()
-	if err != nil {
-		app.logger.Error("Failed to fetch top handles: %v", err)
-		return fmt.Errorf("failed to fetch top handles: %w", err)
-	}
-	app.logger.Info("Successfully fetched %d handles from multiple sources", len(handles))
-
-	// Create a map of existing users for quick lookup
-	existingMap := make(map[string]bool)
-	for _, user := range existingUsers {
-		existingMap[user.Handle] = true
-	}
-
-	// Process each handle
+	now := time.Now()
 	for _, handle := range handles {
-		if existingMap[handle] {
-			app.logger.Debug("Skipping existing user: %s", handle)
+		// Skip if we've already processed this handle recently
+		var existingUser TargetUser
+		err := app.db.QueryRow("SELECT * FROM users WHERE handle = ?", handle).Scan(
+			&existingUser.Handle,
+			&existingUser.DID,
+			&existingUser.Followers,
+			&existingUser.SavedOn,
+			&existingUser.Followed,
+			&existingUser.LastChecked,
+			&existingUser.FollowDate,
+			&existingUser.Priority,
+			&existingUser.Attempts,
+		)
+		if err == nil && !existingUser.LastChecked.IsZero() && time.Since(existingUser.LastChecked) < 24*time.Hour {
+			app.logger.Debug("Skipping recently checked user: %s", handle)
 			continue
 		}
 
-		app.logger.Info("Processing new user: %s", handle)
+		// Get user's DID
+		did, err := app.getDID(session, handle)
+		if err != nil {
+			app.logger.Warn("Failed to get DID for %s: %v", handle, err)
+			continue
+		}
+
+		// Get follower count
 		followers, err := app.getFollowerCount(session, handle)
 		if err != nil {
 			app.logger.Warn("Failed to get follower count for %s: %v", handle, err)
 			continue
 		}
 
-		// Skip users with very low follower counts
-		if followers < 100 {
-			app.logger.Debug("Skipping user with low follower count: %s (%d followers)", handle, followers)
+		// Calculate priority based on follower count
+		priority := 1
+		if followers > 10000 {
+			priority = 3
+		} else if followers > 1000 {
+			priority = 2
+		}
+
+		user := TargetUser{
+			Handle:      handle,
+			DID:         did,
+			Followers:   followers,
+			SavedOn:     now,
+			LastChecked: now,
+			Priority:    priority,
+		}
+
+		// Save to database
+		if err := app.saveUserToDB(user); err != nil {
+			app.logger.Error("Failed to save user %s: %v", handle, err)
 			continue
 		}
 
-		newUser := TargetUser{
-			Handle:    handle,
-			Followers: followers,
-			SavedOn:   time.Now().Format(time.RFC3339),
+		// Add to follow queue if not already followed
+		if !user.Followed {
+			app.addToFollowQueue(user, priority)
 		}
 
-		if err := app.saveUserToDB(newUser); err != nil {
-			app.logger.Error("Failed to save user %s: %v", handle, err)
-			return fmt.Errorf("failed to save user %s: %w", handle, err)
-		}
-		app.logger.Info("Successfully saved user: %s (followers: %d)", handle, followers)
+		// Rate limiting
+		time.Sleep(1 * time.Second)
 	}
 
-	app.logger.Info("Completed fetching and saving top users")
 	return nil
 }
 
@@ -544,14 +545,14 @@ func (app *App) getDID(session *Session, handle string) (string, error) {
 	url := apiBase + "/app.bsky.actor.getProfile?actor=" + handle
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		app.logger.Error("Failed to create profile request: %v", err)
+		app.logger.Error("Failed to create profile request", "error", err)
 		return "", fmt.Errorf("failed to create profile request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+session.AccessJwt)
 	
 	resp, err := app.client.Do(req)
 	if err != nil {
-		app.logger.Error("Failed to fetch profile: %v", err)
+		app.logger.Error("Failed to fetch profile", "error", err)
 		return "", fmt.Errorf("failed to fetch profile: %w", err)
 	}
 	defer resp.Body.Close()
@@ -565,7 +566,7 @@ func (app *App) getDID(session *Session, handle string) (string, error) {
 		Did string `json:"did"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		app.logger.Error("Failed to decode profile response: %v", err)
+		app.logger.Error("Failed to decode profile response", "error", err)
 		return "", fmt.Errorf("failed to decode profile response: %w", err)
 	}
 	
@@ -634,13 +635,13 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {
-		app.logger.Error("Failed to marshal follow request: %v", err)
+		app.logger.Error("Failed to marshal follow request", "error", err)
 		return fmt.Errorf("failed to marshal follow request: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", apiBase+"/com.atproto.repo.createRecord", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		app.logger.Error("Failed to create follow request: %v", err)
+		app.logger.Error("Failed to create follow request", "error", err)
 		return fmt.Errorf("failed to create follow request: %w", err)
 	}
 	
@@ -650,7 +651,7 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 	app.logger.Debug("Sending follow request for %s (DID: %s)", handleOrDid, did)
 	resp, err := app.client.Do(req)
 	if err != nil {
-		app.logger.Error("Failed to execute follow request: %v", err)
+		app.logger.Error("Failed to execute follow request", "error", err)
 		return fmt.Errorf("failed to execute follow request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -670,10 +671,10 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 			WHERE handle = ? OR did = ?
 		`, did, handleOrDid, handleOrDid)
 		if err != nil {
-			app.logger.Error("Failed to update user's followed status: %v", err)
+			app.logger.Error("Failed to update user's followed status", "error", err)
 			return fmt.Errorf("failed to update user's followed status: %w", err)
 		}
-		app.logger.Audit("User followed: %s (DID: %s)", handleOrDid, did)
+		app.logger.Audit("User followed", "handle", handleOrDid, "DID", did)
 	} else if strings.Contains(string(body), "already following") {
 		app.logger.Info("Already following: %s (took %v)", handleOrDid, time.Since(startTime))
 		app.followed[handleOrDid] = true
@@ -685,7 +686,7 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 			WHERE handle = ? OR did = ?
 		`, did, handleOrDid, handleOrDid)
 		if err != nil {
-			app.logger.Error("Failed to update user's followed status: %v", err)
+			app.logger.Error("Failed to update user's followed status", "error", err)
 		}
 		return nil
 	} else {
@@ -695,100 +696,114 @@ func (app *App) followUser(session *Session, handleOrDid string, simulate bool) 
 	return nil
 }
 
-func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: .env file not found: %v", err)
+// Heap interface implementation for FollowQueue
+func (pq FollowQueue) Len() int { return len(pq) }
+
+func (pq FollowQueue) Less(i, j int) bool {
+	return pq[i].NextTry.Before(pq[j].NextTry)
+}
+
+func (pq FollowQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].index = i
+	pq[j].index = j
+}
+
+func (pq *FollowQueue) Push(x interface{}) {
+	n := len(*pq)
+	item := x.(*FollowQueueItem)
+	item.index = n
+	*pq = append(*pq, item)
+}
+
+func (pq *FollowQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	item.index = -1
+	*pq = old[0 : n-1]
+	return item
+}
+
+// update updates the priority and value of an Item in the queue.
+func (pq *FollowQueue) update(item *FollowQueueItem, priority int, nextTry time.Time) {
+	item.Priority = priority
+	item.NextTry = nextTry
+	heap.Fix(pq, item.index)
+}
+
+// Queue management functions
+func (app *App) addToFollowQueue(user TargetUser, priority int) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	item := &FollowQueueItem{
+		User:     user,
+		Priority: priority,
+		Attempts: 0,
+		NextTry:  time.Now(),
+	}
+	heap.Push(app.queue, item)
+	app.logger.Audit("Added user %s to follow queue with priority %d", user.Handle, priority)
+}
+
+func (app *App) processFollowQueue(session *Session) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	now := time.Now()
+	
+	// Reset follow count if an hour has passed
+	if now.After(app.followReset) {
+		app.followCount = 0
+		app.followReset = now.Add(time.Hour)
 	}
 
-	// Parse command line flags
-	simulate := flag.Bool("simulate", false, "Simulate actions without making actual changes")
-	updateTop := flag.Bool("update-top", false, "Fetch top users from bsky.directory and save to database")
-	minFollowers := flag.String("min-followers", "0", "Minimum followers required to follow")
-	realFollow := flag.Bool("real", false, "Actually follow users (default is simulation only)")
-	flag.Parse()
-
-	// Load configuration
-	config, err := loadConfig()
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
-	}
-
-	app, err := NewApp(config)
-	if err != nil {
-		log.Fatalf("Failed to create application: %v", err)
-	}
-	defer app.db.Close()
-
-	app.logger.Info("Starting Bluesky follower application")
-	app.logger.Info("Configuration loaded: timeout=%v, simulate=%v", config.Timeout, *simulate)
-
-	if *updateTop {
-		if err := app.fetchAndSaveTopUsers(*simulate); err != nil {
-			app.logger.Error("Failed to fetch and save top users: %v", err)
-			os.Exit(1)
-		}
+	// Check if we've hit the rate limit
+	if app.followCount >= maxFollowsPerHour {
+		app.logger.Warn("Rate limit reached, waiting for reset")
 		return
 	}
 
-	// Load users from database
-	users, err := app.loadUsersFromDB()
-	if err != nil {
-		app.logger.Error("Failed to load users: %v", err)
-		os.Exit(1)
-	}
-
-	// Parse minimum followers
-	minFollowersCount, err := strconv.Atoi(*minFollowers)
-	if err != nil {
-		app.logger.Error("Invalid minimum followers value: %v", err)
-		os.Exit(1)
-	}
-
-	// Login to get session
-	session, err := app.login()
-	if err != nil {
-		app.logger.Error("Failed to login: %v", err)
-		os.Exit(1)
-	}
-
-	// Process each user
-	for _, user := range users {
-		time.Sleep(3 * time.Second) // Rate limiting
-
-		actor := user.Handle
-		if actor == "" {
-			actor = user.DID
+	// Process queue items that are ready
+	for app.queue.Len() > 0 {
+		item := (*app.queue)[0]
+		if item.NextTry.After(now) {
+			break
 		}
-		if actor == "" {
-			app.logger.Warn("Skipping user with no handle or DID")
+
+		// Remove from queue
+		heap.Pop(app.queue)
+
+		// Attempt to follow
+		err := app.followUser(session, item.User.DID, false)
+		if err != nil {
+			item.Attempts++
+			if item.Attempts < maxRetries {
+				// Add back to queue with exponential backoff
+				item.NextTry = now.Add(retryDelay * time.Duration(item.Attempts))
+				heap.Push(app.queue, item)
+				app.logger.Warn("Failed to follow %s, retrying in %v", item.User.Handle, item.NextTry.Sub(now))
+			} else {
+				app.logger.Error("Failed to follow %s after %d attempts", item.User.Handle, maxRetries)
+			}
 			continue
 		}
 
-		// Update follower count if needed
-		count := user.Followers
-		if count == 0 {
-			count, err = app.getFollowerCount(session, actor)
-			if err != nil {
-				app.logger.Warn("Skipping %s (error getting follower count: %v)", actor, err)
-				continue
-			}
-			user.Followers = count
-			user.SavedOn = time.Now().UTC().Format(time.RFC3339)
-			if err := app.saveUserToDB(user); err != nil {
-				app.logger.Error("Failed to save updated user %s: %v", actor, err)
-			}
-		}
+		// Update follow tracking
+		app.followCount++
+		app.lastFollow = now
+		app.logger.Audit("Successfully followed %s", item.User.Handle)
 
-		// Skip if below minimum followers
-		if count < minFollowersCount {
-			app.logger.Info("Skipping %s (%d < min %d)", actor, count, minFollowersCount)
-			continue
-		}
-
-		// Follow user
-		if err := app.followUser(session, actor, !*realFollow); err != nil {
-			app.logger.Error("Follow error: %v", err)
+		// Update database
+		item.User.Followed = true
+		if err := app.saveUserToDB(item.User); err != nil {
+			app.logger.Error("Failed to update database for %s: %v", item.User.Handle, err)
 		}
 	}
+}
+
+func main() {
+	
 }

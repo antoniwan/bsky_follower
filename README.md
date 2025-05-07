@@ -1,47 +1,30 @@
-# 🦋 Bluesky Follower
+# Bluesky Follower
 
-A Go program to help manage following users on Bluesky social network.
+An automated tool for following users on Bluesky (AT Protocol) with intelligent queue management and rate limiting.
 
-## ✨ Features
+## Features
 
-- 🔐 Login to Bluesky using your credentials
-- 👥 Follow users from a database
-- 🔍 Filter users by minimum follower count
-- 🎮 Simulation mode to preview actions
-- 📊 Track already followed users
-- 🔄 Update follower counts automatically
-- 📥 Fetch and save top users from Bluesky directory
-- 📝 Enhanced logging with debug mode
-- 💾 SQLite database for reliable data storage
-- 🆔 Proper DID (Decentralized Identifier) handling
-- ⏱️ Rate limiting and error handling
+- Automatic user discovery from multiple Bluesky sources
+- Priority-based following queue (prioritizes users with more followers)
+- Rate limiting to avoid API restrictions
+- Retry mechanism with exponential backoff
+- Comprehensive structured logging with rotation
+- SQLite database for persistent storage
+- Session management and automatic refresh
 
-## 📋 Requirements
+## Prerequisites
 
-- Go 1.16 or later
-- Bluesky account credentials
+- Go 1.16 or higher
+- SQLite3
+- A Bluesky account
 
-## 🛠️ Setup
+## Installation
 
-1. Create a `.env` file in the project root with the following variables:
+1. Clone the repository:
 
 ```bash
-# BlueSky API Configuration
-BSKY_IDENTIFIER=your.bsky.social
-BSKY_PASSWORD=your_app_password
-
-# Application Settings
-DEBUG_MODE=false
-REQUEST_TIMEOUT=30s
-
-# Database Configuration
-DB_PATH=users.db
-
-# Fallback Handles (comma-separated list of handles to use if directory fetch fails)
-FALLBACK_HANDLES=handle1.bsky.social,handle2.bsky.social
-
-# Rate Limiting
-RATE_LIMIT_DELAY=1s
+git clone https://github.com/yourusername/bsky_follower.git
+cd bsky_follower
 ```
 
 2. Install dependencies:
@@ -50,141 +33,201 @@ RATE_LIMIT_DELAY=1s
 go mod download
 ```
 
-3. Run the application:
+3. Create a `.env` file based on `.env-example`:
+
+```bash
+cp .env-example .env
+```
+
+4. Edit the `.env` file with your Bluesky credentials and logging configuration:
+
+```env
+# Bluesky Configuration
+BSKY_IDENTIFIER=your.handle.bsky.social
+BSKY_PASSWORD=your_password
+BSKY_TIMEOUT=10
+BSKY_FALLBACK_HANDLES=user1.bsky.social,user2.bsky.social
+
+# Logging Configuration
+DEBUG_MODE=true
+LOG_LEVEL=debug  # Options: debug, info, warn, error
+```
+
+5. Initialize the database with the proper schema:
+
+```bash
+go run main.go -init-db
+```
+
+## Usage
+
+### Basic Usage
+
+Run the application in normal mode:
 
 ```bash
 go run main.go
 ```
 
-## 🚀 Usage
+The application will:
 
-The application supports the following command-line flags:
+1. Load existing users from the database
+2. Start the follow queue processor
+3. Periodically fetch new users from Bluesky
+4. Follow users based on their priority (higher follower count = higher priority)
+
+### Command Line Flags
 
 - `-simulate`: Run in simulation mode (no actual follows)
-- `-update-top`: Fetch top users from bsky.directory and save to database
-- `-min-followers`: Minimum followers required to follow (default: 0)
-- `-real`: Actually follow users (default is simulation only)
+- `-init-db`: Initialize database with proper schema (WARNING: This will delete existing data)
 
-### 💡 Examples
+### Simulation Mode
 
-1. Fetch and save top users:
+To test without actually following users:
 
 ```bash
-go run main.go --update-top
+go run main.go -simulate
 ```
 
-2. Follow users with minimum followers:
+### Rate Limits
 
-```bash
-go run main.go --min-followers 1000 --real
-```
+The application enforces the following rate limits:
 
-3. Simulate following users:
+- Maximum 50 follows per hour
+- 1-second delay between API calls
+- Session refresh every 24 hours
 
-```bash
-go run main.go --simulate
-```
+### Priority Levels
 
-## 💾 Data Storage
+Users are prioritized based on their follower count:
 
-The application uses SQLite for data storage. All user data is stored in `users.db` with the following schema:
+- Priority 3: >10,000 followers
+- Priority 2: >1,000 followers
+- Priority 1: All other users
+
+### Database
+
+The application uses SQLite to store user information. The database file (`users.db`) contains:
+
+- User handles and DIDs
+- Follower counts
+- Follow status
+- Last check time
+- Follow date
+- Priority level
+- Follow attempts
+
+### Logging
+
+The application uses a robust logging system with the following features:
+
+#### Log Levels
+
+- DEBUG: Detailed debugging information (when DEBUG_MODE=true)
+- INFO: General information
+- WARN: Warning messages
+- ERROR: Error messages with stack traces
+- AUDIT: Important actions with timestamps
+
+#### Log Output
+
+- Console output with colored formatting
+- File output in JSON format (`logs/bsky_follower.log`)
+- Automatic log rotation:
+  - Max file size: 100MB
+  - Max backups: 3
+  - Max age: 7 days
+  - Compression enabled
+
+#### Log Format
+
+- Timestamps in ISO8601 format
+- Structured fields for better parsing
+- Stack traces for errors
+- Caller information
+- Audit trail with additional metadata
+
+## Configuration
+
+### Environment Variables
+
+#### Bluesky Configuration
+
+- `BSKY_IDENTIFIER`: Your Bluesky handle
+- `BSKY_PASSWORD`: Your Bluesky password
+- `BSKY_TIMEOUT`: API request timeout in seconds
+- `BSKY_FALLBACK_HANDLES`: Comma-separated list of fallback handles
+
+#### Logging Configuration
+
+- `DEBUG_MODE`: Enable debug logging (true/false)
+- `LOG_LEVEL`: Minimum log level (debug, info, warn, error)
+
+### Database Schema
 
 ```sql
 CREATE TABLE users (
     handle TEXT PRIMARY KEY,
     did TEXT,
     followers INTEGER,
-    saved_on TEXT,
-    followed BOOLEAN
+    saved_on TIMESTAMP,
+    followed BOOLEAN,
+    last_checked TIMESTAMP,
+    follow_date TIMESTAMP,
+    priority INTEGER DEFAULT 1,
+    attempts INTEGER DEFAULT 0
 )
 ```
 
-Fields:
+## Safety Features
 
-- `handle`: The user's Bluesky handle (e.g., "username.bsky.social")
-- `did`: The user's Decentralized Identifier (DID)
-- `followers`: Number of followers
-- `saved_on`: Timestamp when the user was added
-- `followed`: Whether the user has been followed
+1. **Rate Limiting**: Prevents hitting Bluesky API limits
+2. **Retry Mechanism**: Automatically retries failed follows
+3. **Session Management**: Refreshes session token periodically
+4. **Duplicate Prevention**: Checks both memory and database for already followed users
+5. **Error Handling**: Comprehensive error handling and logging
+6. **Log Rotation**: Prevents disk space issues from log files
 
-## 📝 Logging
+## Troubleshooting
 
-The application provides detailed logging with multiple levels:
+### Database Issues
 
-- `TRACE`: Most detailed logging (only in debug mode)
-- `DEBUG`: Detailed logging (only in debug mode)
-- `INFO`: General information
-- `WARN`: Warning messages
-- `ERROR`: Error messages
-- `AUDIT`: Important state changes
+If you encounter database-related errors, you can reinitialize the database:
 
-To enable debug mode, set `DEBUG_MODE=true` in your environment variables.
+1. Backup your existing database (optional):
 
-## ⚙️ Environment Variables
+```bash
+cp users.db users.db.backup
+```
 
-- `BSKY_IDENTIFIER`: Your Bluesky handle or email
-- `BSKY_PASSWORD`: Your Bluesky app password
-- `BSKY_FALLBACK_HANDLES`: Comma-separated list of fallback handles (optional)
-- `BSKY_TIMEOUT`: Request timeout in seconds (optional, default: 10)
-- `DEBUG_MODE`: Enable detailed logging (optional, default: false)
+2. Initialize a fresh database:
 
-## 📌 Notes
+```bash
+go run main.go -init-db
+```
 
-- ⏭️ The program will skip users you're already following
-- 🔄 Follower counts are automatically updated if not provided
-- ⏱️ A 3-second delay is added between operations to avoid rate limiting
-- 📊 The program tracks followed users in both memory and database
-- 💾 SQLite database provides reliable data storage and atomic updates
-- 🆔 Proper DID handling ensures successful follows
-- ❌ Error handling for common Bluesky API issues
+This will create a new database with the correct schema. Note that this will delete all existing data.
 
-## 📅 Version History
+### Logging Issues
 
-### v1.1.0 (2024-05-15)
+If you need to adjust logging behavior:
 
-- ✨ Added enhanced user filtering capabilities
-- 🚀 Improved performance with optimized database queries
-- 🛠️ Fixed rate limiting issues
-- 📊 Added detailed statistics tracking
-- 🔄 Improved error recovery mechanisms
+1. Check the log files in the `logs` directory
+2. Adjust log level in `.env` file
+3. Monitor log rotation settings if disk space is a concern
 
-### v1.0.0 (2024-04-30)
+## Contributing
 
-- 🎉 Initial stable release
-- 🛠️ Fixed DID handling for follow operations
-- 🚨 Improved error handling and logging
-- ⏱️ Added proper rate limiting
-- 💾 Enhanced database operations
+1. Fork the repository
+2. Create your feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a new Pull Request
 
----
+## License
 
-## 🔐 Auth Notes
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-Bluesky uses **App Passwords**, which you can generate [here](https://bsky.app/settings/app-passwords). You do **not** need API keys or tokens.
+## Disclaimer
 
-The script logs in using your handle/email and app password and fetches your DID + JWT token securely.
-
----
-
-## 🚀 Planned Features
-
-- 📈 Dynamic trending user fetch with customizable filters
-- 📤 Export/import database functionality with JSON/CSV support
-- 💾 Automated backup and restore functionality
-- 📦 Batch processing for large user lists with progress tracking
-- ⚙️ Customizable rate limiting based on API response headers
-- 🔍 Advanced user search and filtering capabilities
-- 📊 Enhanced analytics dashboard
-- 🔄 Real-time follower count updates
-- 🎯 Smart following recommendations based on user interests
-
----
-
-Built by [@antoniwan](https://github.com/antoniwan) 🛠️
-
-## 🔒 Security Notes
-
-- 🚫 Never commit your `.env` file to version control
-- 🔐 Keep your app password secure
-- 💾 The application uses SQLite for data storage - ensure proper file permissions
-- 🐛 Debug mode should be disabled in production
+This tool is for educational purposes only. Use responsibly and in accordance with Bluesky's terms of service. Excessive following may result in account restrictions.
