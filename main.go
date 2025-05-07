@@ -805,5 +805,90 @@ func (app *App) processFollowQueue(session *Session) {
 }
 
 func main() {
-	
+	// Load configuration
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Printf("Error loading configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize application
+	app, err := NewApp(config)
+	if err != nil {
+		fmt.Printf("Error initializing application: %v\n", err)
+		os.Exit(1)
+	}
+	defer app.db.Close()
+
+	var session *Session
+	var isAuthenticated bool
+
+	for {
+		fmt.Println("\nBlueSky Follower Menu:")
+		fmt.Println("1. Authenticate to BlueSky")
+		fmt.Println("2. Fetch and Save Top Users")
+		fmt.Println("3. Process Follow Queue")
+		fmt.Println("4. Exit")
+
+		if isAuthenticated {
+			fmt.Println("\nCurrently authenticated as:", session.Handle)
+			fmt.Println("5. Logout from BlueSky")
+		}
+
+		fmt.Print("\nSelect an option: ")
+		var choice string
+		fmt.Scanln(&choice)
+
+		switch choice {
+		case "1":
+			if isAuthenticated {
+				fmt.Println("Already authenticated as:", session.Handle)
+				continue
+			}
+			session, err = app.login()
+			if err != nil {
+				fmt.Printf("Authentication failed: %v\n", err)
+				continue
+			}
+			isAuthenticated = true
+			fmt.Printf("Successfully authenticated as: %s\n", session.Handle)
+
+		case "2":
+			if !isAuthenticated {
+				fmt.Println("Please authenticate first")
+				continue
+			}
+			fmt.Println("Fetching and saving top users...")
+			err = app.fetchAndSaveTopUsers(false)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			} else {
+				fmt.Println("Successfully fetched and saved top users")
+			}
+
+		case "3":
+			if !isAuthenticated {
+				fmt.Println("Please authenticate first")
+				continue
+			}
+			fmt.Println("Processing follow queue...")
+			app.processFollowQueue(session)
+
+		case "4":
+			fmt.Println("Goodbye!")
+			return
+
+		case "5":
+			if !isAuthenticated {
+				fmt.Println("Not authenticated")
+				continue
+			}
+			session = nil
+			isAuthenticated = false
+			fmt.Println("Successfully logged out")
+
+		default:
+			fmt.Println("Invalid option, please try again")
+		}
+	}
 }
