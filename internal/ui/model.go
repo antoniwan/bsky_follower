@@ -22,6 +22,7 @@ type Model struct {
 	client *api.Client
 	config *models.Config
 	status *StatusMsg
+	queue *models.FollowQueue
 }
 
 func NewModel(config *models.Config) Model {
@@ -29,6 +30,7 @@ func NewModel(config *models.Config) Model {
 		menuIndex: 0,
 		config: config,
 		client: api.NewClient(config.Timeout, logger.GetAPILogger()),
+		queue: &models.FollowQueue{},
 	}
 }
 
@@ -59,6 +61,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Message: fmt.Sprintf("Successfully authenticated as %s", msg.Session.Handle),
 			Type:    StatusSuccess,
 			Time:    time.Now(),
+		}
+		return m, nil
+
+	case QueueMsg:
+		if msg.Error != nil {
+			m.status = &StatusMsg{
+				Message: fmt.Sprintf("Queue processing failed: %v", msg.Error),
+				Type:    StatusError,
+				Time:    time.Now(),
+			}
+		} else {
+			m.status = &StatusMsg{
+				Message: msg.Message,
+				Type:    StatusInfo,
+				Time:    time.Now(),
+			}
 		}
 		return m, nil
 
@@ -114,8 +132,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				}
-				// TODO: Implement process queue
-				return m, nil
+				return m, QueueCmd(m.client, m.session, m.queue)
 			}
 		}
 	}
@@ -170,6 +187,12 @@ func (m Model) View() string {
 	} else {
 		status := uiStatusStyle.Render("Not authenticated")
 		b.WriteString(status + "\n")
+	}
+
+	// Queue status
+	if m.queue != nil {
+		queueStatus := uiStatusStyle.Render(fmt.Sprintf("Queue size: %d", m.queue.Len()))
+		b.WriteString(queueStatus + "\n")
 	}
 
 	// Help
